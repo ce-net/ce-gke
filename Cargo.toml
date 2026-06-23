@@ -1,0 +1,46 @@
+[package]
+name = "ce-gke"
+version = "0.1.0"
+edition = "2024"
+description = "Container orchestrator (GKE-like) on CE — declarative Deployments reconciled to a desired replica count across atlas-ranked hosts over jobs/mesh-deploy, with health/restart, rolling update, and scale. An application built ON CE primitives (jobs/atlas/swarm patterns, ce-cap, mesh), not part of the node."
+license = "MIT"
+repository = "https://github.com/ce-net/ce-gke"
+keywords = ["ce", "orchestrator", "kubernetes", "gke", "p2p"]
+categories = ["command-line-utilities", "network-programming"]
+authors = ["Leif Rydenfalk <ledamecrydenfalk@gmail.com>"]
+
+# ce-gke is both a reusable library (the reconcile loop, placement ranking, rolling-update planner,
+# Deployment spec types) and the `ce-gke` binary. The library is unit/property-tested; the binary
+# is the CLI over it.
+[lib]
+name = "ce_gke"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ce-gke"
+path = "src/main.rs"
+
+[dependencies]
+# The CE SDK: atlas/history (placement), mesh-deploy/mesh-kill (directed placement), jobs (status),
+# blobs, payment channels, content-addressing. Money is u128 base units, decimal strings on the wire.
+ce-rs = { path = "../ce-rs" }
+# The capability verifier primitive — a deploy is authorized by a signed attenuating chain that the
+# host honors; the orchestrator forwards the grant token on every mesh-deploy/kill.
+ce-cap = { path = "../ce/crates/ce-cap" }
+# Ed25519 identity — `auth` builds host grants signed by the host's identity (the resource owner).
+ce-identity = { path = "../ce/crates/ce-identity" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+hex = "0.4"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+
+[dev-dependencies]
+proptest = "1"

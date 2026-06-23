@@ -1,0 +1,15 @@
+# An example ce-gke Deployment manifest. Apply with: ce-gke apply -f examples/web.yaml
+name: web
+image: nginx:1.25
+replicas: 3
+resources:
+  cpu_cores: 1
+  mem_mb: 256
+select:
+  - docker
+bid: "5000000000000000000"   # 5 credits per replica (base units; 10^18 = 1 credit)
+duration_secs: 3600
+strategy:
+  type: rolling_update
+  max_unavailable: 1
+  max_surge: 1
