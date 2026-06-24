@@ -190,6 +190,7 @@ mod tests {
             bid: Amount::from_credits(1),
             duration_secs: 60,
             strategy: Default::default(),
+            ..Default::default()
         }
     }
 

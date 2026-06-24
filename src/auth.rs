@@ -18,6 +18,8 @@ use ce_identity::{Identity, NodeId};
 pub const ACTION_DEPLOY: &str = "deploy";
 /// The action a kill requires.
 pub const ACTION_KILL: &str = "kill";
+/// The action a health probe requires (the host-side `ce-gke serve` agent verifies it).
+pub const ACTION_PROBE: &str = "probe";
 
 /// Issue a root grant from `host` (the resource owner) to `orchestrator`, authorizing it to deploy
 /// and kill on this host. This is what a host operator runs to onboard an orchestrator (the
@@ -35,7 +37,7 @@ pub fn issue_host_grant(
     SignedCapability::issue(
         host,
         orchestrator,
-        vec![ACTION_DEPLOY.to_string(), ACTION_KILL.to_string()],
+        vec![ACTION_DEPLOY.to_string(), ACTION_KILL.to_string(), ACTION_PROBE.to_string()],
         resource,
         caveats,
         nonce,

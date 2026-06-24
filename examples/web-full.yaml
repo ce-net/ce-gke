@@ -1,0 +1,43 @@
+# A fuller Deployment showcasing env, secrets, probes, a named service, and a namespace.
+# Apply with:  ce-gke -n prod apply -f examples/web-full.yaml
+# (set the referenced secret first:  ce-gke secret set db-password 's3cr3t')
+name: web
+namespace: prod
+image: nginx:1.25
+# env injection requires an explicit command (the SDK BidSpec carries no env field, so ce-gke
+# wraps the command as `env NAME=VALUE ... <command>`).
+command:
+  - nginx
+  - -g
+  - "daemon off;"
+replicas: 3
+resources:
+  cpu_cores: 1
+  mem_mb: 256
+select:
+  - docker
+env:
+  - name: LOG_LEVEL
+    value: info
+  - name: DB_PASSWORD
+    value_from:
+      secret: db-password
+# Liveness: a failing probe trips the replica to Failed so it is replaced.
+liveness:
+  type: http
+  port: 80
+  path: /healthz
+  failure_threshold: 3
+  period_secs: 10
+# Readiness gates the rollout: a replica is only counted available once it passes.
+readiness:
+  type: tcp
+  port: 80
+# Advertise the healthy replica set on the DHT as ce-gke/prod/web-frontend.
+service: web-frontend
+bid: "5000000000000000000"   # 5 credits per replica (base units, 10^18 = 1 credit)
+duration_secs: 3600
+strategy:
+  type: rolling_update
+  max_unavailable: 1
+  max_surge: 1

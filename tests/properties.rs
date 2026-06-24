@@ -5,7 +5,7 @@
 //! These complement the per-module unit tests by checking invariants across a wide input space,
 //! including failure-shaped inputs (zero replicas, all-failed fleets, single-host clusters).
 
-use ce_gke::placement::{rank, score_host};
+use ce_gke::placement::{free_capacity, host_can_fit, rank, score_host};
 use ce_gke::reconcile::{reconcile, Phase, ReplicaState};
 use ce_gke::rollout::{census, plan_step};
 use ce_gke::spec::{Deployment, Resources, Strategy};
@@ -23,6 +23,7 @@ fn deploy(replicas: u32, strategy: Strategy) -> Deployment {
         bid: Amount::from_credits(1),
         duration_secs: 60,
         strategy,
+        ..Default::default()
     }
 }
 
@@ -45,6 +46,7 @@ proptest! {
     ) {
         let d = Deployment {
             name: "svc".into(),
+            namespace: "default".into(),
             image: img,
             command: vec!["run".into()],
             replicas,
@@ -53,6 +55,7 @@ proptest! {
             bid: Amount::from_base((replicas as i128) * 1_000),
             duration_secs: 3600,
             strategy: Strategy::RollingUpdate { max_unavailable: mu, max_surge: ms },
+            ..Default::default()
         };
         let s = serde_json::to_string(&d).unwrap();
         let back: Deployment = serde_json::from_str(&s).unwrap();
@@ -111,6 +114,38 @@ proptest! {
         }
         // every ranked candidate had >= 1 cpu (fits a 1-core replica)
         prop_assert!(ranked.iter().all(|c| c.free_cpu >= 1));
+    }
+
+    /// A ranked candidate always has the headroom it claims: free_cpu/free_mem are enough for one
+    /// replica, so placement never selects a host the fit check would reject (no silent over-commit).
+    #[test]
+    fn rank_never_overcommits(
+        cpu in 1u32..32, mem in 64u32..65536, jobs in 0u32..16, rep_cpu in 1u32..8, rep_mem in 64u64..8192,
+    ) {
+        let d = deploy(1, Strategy::default());
+        let mut d = d;
+        d.resources = Resources { cpu_cores: rep_cpu, mem_mb: rep_mem };
+        let h = AtlasEntry {
+            node_id: "h".into(), cpu_cores: cpu, mem_mb: mem, running_jobs: jobs,
+            last_seen_secs: 0, tags: vec!["docker".into()],
+        };
+        let ranked = rank(std::slice::from_ref(&h), &d, 0, 0);
+        if let Some(c) = ranked.first() {
+            // The candidate was deemed to fit; its reported headroom must cover one replica.
+            prop_assert!(c.free_cpu >= rep_cpu);
+            prop_assert!(c.free_mem_mb >= rep_mem as u32);
+            // And host_can_fit agrees (rank and fit are consistent).
+            prop_assert!(host_can_fit(&h, &d));
+        } else {
+            // If not ranked, the host genuinely cannot fit.
+            prop_assert!(!host_can_fit(&h, &d));
+        }
+        // free_capacity is monotone non-increasing in running_jobs (more load never frees space).
+        let (f0, m0) = free_capacity(&h, rep_cpu, rep_mem as u32);
+        let busier = AtlasEntry { running_jobs: jobs + 1, ..h.clone() };
+        let (f1, m1) = free_capacity(&busier, rep_cpu, rep_mem as u32);
+        prop_assert!(f1 <= f0);
+        prop_assert!(m1 <= m0);
     }
 }
 
@@ -216,5 +251,36 @@ proptest! {
     fn fresh_deploy_converges(desired in 0u32..10, mu in 0u32..4, ms in 0u32..4) {
         prop_assume!(mu > 0 || ms > 0);
         prop_assert!(drive_rollout(desired, mu, ms, 0));
+    }
+}
+
+// ---- probe protocol round-trips + bounds ----
+
+use ce_gke::protocol::{ProbeReply, ProbeRequest, MAX_MESSAGE_BYTES};
+
+proptest! {
+    /// Any probe request with a bounded job id / command survives a bincode round-trip unchanged.
+    #[test]
+    fn probe_request_roundtrip(
+        job in "[a-z0-9-]{0,64}",
+        cmd in prop::collection::vec("[ -~]{0,32}", 0..8),
+        has_grant in any::<bool>(),
+    ) {
+        let req = ProbeRequest {
+            job_id: job,
+            check_command: cmd,
+            grant: if has_grant { Some("deadbeef".into()) } else { None },
+        };
+        let bytes = req.encode().unwrap();
+        prop_assert!(bytes.len() <= MAX_MESSAGE_BYTES);
+        prop_assert_eq!(ProbeRequest::decode(&bytes).unwrap(), req);
+    }
+
+    /// Arbitrary bytes never panic the decoder (ok or err, never crash) and oversized input is
+    /// rejected before allocation.
+    #[test]
+    fn probe_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..1024)) {
+        let _ = ProbeRequest::decode(&bytes);
+        let _ = ProbeReply::decode(&bytes);
     }
 }

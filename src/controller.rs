@@ -17,6 +17,11 @@ use crate::reconcile::{Phase, ReplicaState};
 use crate::rollout::{plan_step, RolloutStep};
 use crate::spec::Deployment;
 
+/// How many consecutive failed health refreshes a replica tolerates before it is treated as
+/// `Failed`. A single transient local-API blip must not mark the whole fleet failed and trigger a
+/// reschedule storm; only a *sustained* inability to confirm a replica condemns it.
+pub const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
+
 /// The controller's tracked state for one deployment: the replicas it has placed.
 #[derive(Debug, Clone, Default)]
 pub struct Controller {
@@ -26,6 +31,12 @@ pub struct Controller {
     pub grant: Option<String>,
     /// Freshness window for atlas candidates (seconds); 0 disables.
     pub max_stale_secs: u64,
+    /// Consecutive refresh failures, per job id. A replica is only marked `Failed` from a refresh
+    /// error after this count reaches [`failure_threshold`](Self::failure_threshold) — bounded
+    /// retry, so a transient API hiccup never mass-fails the fleet.
+    refresh_failures: std::collections::HashMap<String, u32>,
+    /// Threshold for the above. Defaults to [`DEFAULT_FAILURE_THRESHOLD`].
+    pub failure_threshold: u32,
 }
 
 /// What happened in one tick — for logging and for the convergence loop's stop condition.
@@ -39,6 +50,8 @@ pub struct TickReport {
     pub place_failures: u32,
     /// Kills that failed (dropped peer) — will be retried next tick.
     pub kill_failures: u32,
+    /// True if the deployment's named service was (re-)advertised this tick.
+    pub service_advertised: bool,
     /// True when the deployment is fully reconciled on its target revision.
     pub done: bool,
 }
@@ -53,20 +66,54 @@ impl TickReport {
 impl Controller {
     /// New empty controller (no replicas yet).
     pub fn new(grant: Option<String>) -> Self {
-        Controller { replicas: Vec::new(), grant, max_stale_secs: 120 }
+        Controller {
+            replicas: Vec::new(),
+            grant,
+            max_stale_secs: 120,
+            refresh_failures: std::collections::HashMap::new(),
+            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+        }
     }
 
-    /// Refresh every tracked replica's phase from the driver. A replica whose job is unknown to the
-    /// driver (e.g. the host forgot it) is marked `Failed` so it gets rescheduled — fail-safe, never
-    /// a panic.
-    async fn refresh<D: MeshDriver>(&mut self, driver: &D) {
-        for r in &mut self.replicas {
-            match driver.phase(&r.node_id, &r.job_id).await {
-                Ok(p) => r.phase = p,
-                // Lost track of it → treat as failed; the planner will replace it.
-                Err(_) => r.phase = Phase::Failed,
+    /// Refresh every tracked replica's phase from the driver, running the deployment's liveness
+    /// probe (when set) inside the cell. A replica whose refresh *errors* is not condemned on the
+    /// first miss: its consecutive-failure counter is bumped, and only after
+    /// [`failure_threshold`](Self::failure_threshold) sustained failures is it marked `Failed` for
+    /// rescheduling. A successful refresh resets the counter. This prevents a transient local-API
+    /// blip from mass-failing the fleet and triggering a reschedule storm.
+    async fn refresh<D: MeshDriver>(&mut self, driver: &D, d: &Deployment) {
+        let probe = d.liveness.as_ref();
+        let grant = self.grant.clone();
+        // Collect updates first to avoid borrowing self mutably across the await of a method that
+        // also reads self fields.
+        let mut updates: Vec<(String, Option<Phase>)> = Vec::with_capacity(self.replicas.len());
+        for r in &self.replicas {
+            let res = driver.phase(&r.node_id, &r.job_id, probe, grant.as_deref()).await;
+            updates.push((r.job_id.clone(), res.ok()));
+        }
+        for (job_id, maybe_phase) in updates {
+            match maybe_phase {
+                Some(p) => {
+                    self.refresh_failures.remove(&job_id);
+                    if let Some(r) = self.replicas.iter_mut().find(|r| r.job_id == job_id) {
+                        r.phase = p;
+                    }
+                }
+                None => {
+                    let n = self.refresh_failures.entry(job_id.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= self.failure_threshold.max(1)
+                        && let Some(r) = self.replicas.iter_mut().find(|r| r.job_id == job_id)
+                    {
+                        r.phase = Phase::Failed;
+                    }
+                }
             }
         }
+        // Drop counters for replicas we no longer track.
+        let live: std::collections::HashSet<_> =
+            self.replicas.iter().map(|r| r.job_id.clone()).collect();
+        self.refresh_failures.retain(|k, _| live.contains(k));
     }
 
     /// Run one reconcile tick for `d`. Steps:
@@ -80,8 +127,8 @@ impl Controller {
         let mut report = TickReport::default();
         let target = d.revision();
 
-        // 1. Health refresh.
-        self.refresh(driver).await;
+        // 1. Health refresh (with bounded retry + liveness probe).
+        self.refresh(driver, d).await;
 
         // 2. Plan.
         let step: RolloutStep = plan_step(d, &self.replicas, &target);
@@ -195,6 +242,19 @@ impl Controller {
             }
         }
 
+        // 5. Service discovery: if the deployment names a service and we have at least one healthy
+        // replica, advertise it on the DHT so clients can find the live set. Re-advertised each tick
+        // because provider records expire. Best-effort: a failure here never fails the tick.
+        if let Some(service) = d.service_name() {
+            let has_ready = self.replicas.iter().any(|r| r.phase == Phase::Running);
+            if has_ready {
+                match driver.advertise_service(&service).await {
+                    Ok(()) => report.service_advertised = true,
+                    Err(_) => report.service_advertised = false,
+                }
+            }
+        }
+
         Ok(report)
     }
 
@@ -262,6 +322,7 @@ mod tests {
             bid: Amount::from_credits(1),
             duration_secs: 60,
             strategy,
+            ..Default::default()
         }
     }
 
@@ -420,6 +481,78 @@ mod tests {
             ctrl.current().iter().all(|r| r.revision == target),
             "all replicas on the new revision"
         );
+    }
+
+    #[tokio::test]
+    async fn liveness_probe_failure_reschedules_running_replica() {
+        let fake = FakeDriver::new(vec![host("a", 16, 16384), host("b", 16, 16384)]);
+        let mut d = deploy(2, Strategy::default());
+        d.liveness = Some(crate::spec::Probe {
+            kind: crate::spec::ProbeKind::Exec { command: vec!["true".into()] },
+            success_threshold: 1,
+            failure_threshold: 1,
+            period_secs: 1,
+        });
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        ctrl.converge(&fake, &d, 5, |f| f.mark_all_ready()).await.unwrap();
+        assert_eq!(ctrl.current().len(), 2);
+        // A running replica whose probe fails (deadlocked container) must be replaced.
+        let victim = ctrl.current()[0].job_id.clone();
+        fake.fail_probe_on(&victim);
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r.killed.contains(&victim), "probe-failed replica reaped");
+        assert_eq!(r.placed.len(), 1, "replacement placed");
+    }
+
+    #[tokio::test]
+    async fn transient_refresh_error_does_not_immediately_fail() {
+        // A replica whose phase() errors is only condemned after failure_threshold misses.
+        let fake = FakeDriver::new(vec![host("a", 16, 16384)]);
+        let d = deploy(1, Strategy::default());
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        ctrl.failure_threshold = 3;
+        ctrl.converge(&fake, &d, 5, |f| f.mark_all_ready()).await.unwrap();
+        let job = ctrl.current()[0].job_id.clone();
+        // Remove the job from the fake so phase() errors ("unknown job").
+        fake.kill("a", &job, None).await.unwrap();
+        // First two ticks: errors counted but not yet Failed (no reschedule storm).
+        let r1 = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r1.placed.is_empty(), "not yet condemned after 1 miss");
+        let r2 = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r2.placed.is_empty(), "not yet condemned after 2 misses");
+        // Third miss crosses the threshold → replica marked Failed → replacement placed.
+        let r3 = ctrl.tick(&fake, &d).await.unwrap();
+        assert_eq!(r3.placed.len(), 1, "condemned and replaced after threshold");
+    }
+
+    #[tokio::test]
+    async fn service_is_advertised_when_ready() {
+        let fake = FakeDriver::new(vec![host("a", 16, 16384), host("b", 16, 16384)]);
+        let mut d = deploy(2, Strategy::default());
+        d.service = "web".into();
+        d.namespace = "prod".into();
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        // First tick: replicas Pending → not advertised yet.
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(!r.service_advertised, "no ready replicas yet");
+        // After they become ready, the next tick advertises.
+        fake.mark_all_ready();
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r.service_advertised, "service advertised once ready");
+        assert!(fake.advertised_services().contains(&"ce-gke/prod/web".to_string()));
+    }
+
+    #[tokio::test]
+    async fn no_service_means_no_advertise() {
+        let fake = FakeDriver::new(vec![host("a", 16, 16384)]);
+        let d = deploy(1, Strategy::default()); // no service
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        ctrl.converge(&fake, &d, 5, |f| f.mark_all_ready()).await.unwrap();
+        assert!(fake.advertised_services().is_empty());
     }
 
     #[tokio::test]

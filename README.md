@@ -21,6 +21,29 @@ ip:port. Authorization between nodes is always a `ce-cap` chain. This is the GKE
 
 ---
 
+## Features
+
+- **Declarative Deployments** (YAML or JSON manifests), content-addressed pod-template `revision()`.
+- **Atlas-ranked placement** — tag-fit + free-capacity + spread scoring + freshness, with host
+  fallback when a chosen host rejects a deploy.
+- **Self-healing** — failed/lost replicas are reaped and replaced.
+- **Continuous reconcile daemon** (`ce-gke run`) — reconciles the whole fleet *forever* with graceful
+  SIGINT/SIGTERM shutdown. This is what makes self-healing real between commands.
+- **Rolling update / recreate** honoring `max_surge` / `max_unavailable` budgets.
+- **Rollout history** + `rollout undo` / `pause` / `resume` (last 10 revisions kept).
+- **Namespaces** — `--namespace`; two teams never collide on a name.
+- **Health probes** — liveness (trips a replica to `Failed`) and readiness, exec/tcp/http, answered by
+  the host-side `ce-gke serve` agent over the mesh (authoritative host view, not the payer's cache),
+  with a status-only fallback when no agent runs.
+- **Env vars & secrets** — inline `env`, or `value_from` a local secret store (`ce-gke secret set`)
+  that keeps credentials out of manifests and persisted state.
+- **Service discovery** — advertise the healthy replica set on the DHT (`ce-gke/<ns>/<service>`).
+- **Capability + balance preflight** — a bad/expired grant or insufficient balance fails fast.
+- **Atomic, locked, versioned state** — temp-file + fsync + rename, an advisory inter-process lock,
+  and a schema version with forward migration from older files.
+
+---
+
 ## Install / build
 
 ```bash
@@ -35,14 +58,36 @@ auto-discovered (see `ce-rs`).
 ## CLI
 
 ```
-ce-gke apply   -f deploy.yaml      # create/update a Deployment and reconcile to it
-ce-gke get     [name]              # list deployments (or one) with READY counts + revision
-ce-gke scale   <name> <replicas>   # change the replica count and reconcile
-ce-gke rollout <name>              # reconcile to convergence now (drive a roll / heal failures)
-ce-gke delete  <name>              # kill all replicas and forget the deployment
+ce-gke apply   -f deploy.yaml          # create/update a Deployment and reconcile to it
+ce-gke get     [name]                  # list deployments (or one) with READY counts + revision
+ce-gke scale   <name> <replicas>       # change the replica count and reconcile
+ce-gke rollout status  <name>          # reconcile to convergence now (drive a roll / heal failures)
+ce-gke rollout undo    <name> [--to-revision <hash>]   # roll back to a prior revision
+ce-gke rollout pause   <name>          # hold the rollout (count/health reconcile still runs)
+ce-gke rollout resume  <name>          # resume a paused rollout
+ce-gke rollout history <name>          # show kept revisions
+ce-gke delete  <name> [--force]        # kill all replicas and forget the deployment
+ce-gke run     [--every N] [--all-namespaces]   # long-running daemon: reconcile the fleet forever
+ce-gke serve   [--require-grant]       # host-side health agent (answer probe requests)
+ce-gke secret  set|rm|ls               # manage secrets for value_from env vars
 ```
 
-Global flags: `--node <url>`, `--grant <hex-cap-chain>`, `--state <path>`, `--max-ticks`, `--interval`.
+Global flags: `--node <url>`, `--grant <hex-cap-chain>`, `--namespace/-n <ns>`, `--state <path>`,
+`--secrets <path>`, `--max-ticks`, `--interval`.
+
+### The daemon — real self-healing
+
+`ce-gke apply` reconciles only within a bounded tick budget, then returns. To keep the fleet healthy
+*between* commands (a replica that dies after `apply` returns), run the daemon:
+
+```bash
+ce-gke run --every 10            # reconcile every namespace's deployments every 10s, forever
+ce-gke -n prod run --every 10    # just the `prod` namespace
+```
+
+It loops `reconcile` over every managed deployment, replacing failures and re-advertising services,
+until you Ctrl-C (it shuts down gracefully). It holds the state lock only briefly per pass, so
+interactive commands still work alongside it.
 
 State (desired specs + the replica handles the controller launched) is persisted to
 `<data_dir>/ce/gke-state.json`, so the orchestrator is **stateful across invocations** with no
@@ -132,19 +177,23 @@ desired state every tick is a no-op.
 A host runs *your* replica only if you present a capability chain it honors. A host operator
 onboards an orchestrator exactly like `ce grant`:
 
-```rust
+```rust,ignore
 use ce_gke::auth::{issue_host_grant, token};
 use ce_cap::{Resource, Caveats};
+use ce_identity::Identity;
 
-// On the HOST (the resource owner), self-issue a deploy/kill grant to the orchestrator's NodeId:
-let cap = issue_host_grant(&host_identity, orchestrator_node_id, Resource::Any, Caveats::default(), 1);
+// On the HOST (the resource owner), self-issue a deploy/kill/probe grant to the orchestrator's id:
+let host: Identity = Identity::load_or_generate("/var/lib/ce/identity".as_ref())?;
+let orchestrator_node_id = /* the orchestrator's [u8;32] NodeId */ [0u8; 32];
+let cap = issue_host_grant(&host, orchestrator_node_id, Resource::Any, Caveats::default(), 1);
 let grant = token(&[cap]);   // hex chain — pass as `--grant` (or per-deployment in state)
 ```
 
-The orchestrator forwards `grant` on every `mesh-deploy` / `mesh-kill`; the **host** verifies it
-(offline, in microseconds) — abilities `deploy` / `kill`, scoped resource, expiry, revocation. For a
-fleet, one grant rooted at a key all hosts honor covers them all. `auth::preflight` mirrors the
-host's check locally so the CLI can reject a bad/expired/over-broad token before hitting the mesh.
+The orchestrator forwards `grant` on every `mesh-deploy` / `mesh-kill` / probe; the **host** verifies
+it (offline, in microseconds) — abilities `deploy` / `kill` / `probe`, scoped resource, expiry,
+revocation. For a fleet, one grant rooted at a key all hosts honor covers them all. `auth::preflight`
+mirrors the host's check locally so the CLI can reject a bad/expired/over-broad token before hitting
+the mesh, and `apply` also runs a **balance pre-check** so a too-large `replicas * bid` fails fast.
 
 ---
 
@@ -164,10 +213,42 @@ Built with tests from the start — the foundation is validated, not assumed:
   dropped peer on kill → retried / substituted; a `running` replica that dies → rescheduled; an
   empty/non-docker atlas → reported, never panics; malformed manifests/tokens → graceful errors.
 
+- **Integration tests** (`tests/cli_flow.rs`): the full apply -> scale -> rolling-update -> undo ->
+  delete lifecycle and the daemon reconcile-pass driving multiple namespaces, plus statefulness
+  across simulated CLI invocations (load -> mutate -> save).
+- **Probe protocol + agent** (`serve` / `protocol`): authorization (grant required / open / wrong
+  requester / malformed / revoked), unknown-job-is-failed, size bounds, and round-trips.
+
 ```bash
-cargo test            # ~105 tests, all green
-cargo clippy --all-targets   # clean
+# Do NOT run cargo locally in this workspace (shared full disk). Use the Hetzner box:
+tools/remote-test.sh ce-gke --clippy   # 162 tests + 2 doctests, all green; clippy clean
 ```
+
+---
+
+## Architecture & limitations (vs GKE)
+
+ce-gke is a deliberate **CLI + daemon client**, not an always-on control plane with its own etcd.
+Desired state and replica handles live in `gke-state.json`; the `run` daemon supplies the continuous
+reconcile loop GKE's controllers provide. See [`docs/architecture.md`](docs/architecture.md) for the
+deploy -> escrow -> heartbeat -> settle lifecycle and the CLI-vs-daemon ADR.
+
+| GKE capability | ce-gke | Notes |
+|---|---|---|
+| Declarative Deployments | yes | YAML/JSON, content-addressed revision |
+| Scheduler / node fit + scoring | yes | atlas-ranked, spread, freshness, fallback |
+| Self-healing controllers | yes | `ce-gke run` daemon (continuous), CLI ticks (bounded) |
+| Rolling update / Recreate | yes | surge / unavailable budgets, property-tested |
+| Rollout history / undo / pause | yes | last 10 revisions |
+| Namespaces | yes | scoped keys + per-namespace listing |
+| Liveness / readiness probes | partial | host-agent reports authoritative phase; in-cell probe **command** execution is deferred to a container-exec sidecar (CE exposes no exec RPC to apps) |
+| Env vars / Secrets | yes | inline + `value_from` local store; injected via `env` command wrap (requires explicit `command`) |
+| Services / discovery | partial | DHT advertise of the healthy set; client-side LB, virtual IP/DNS deferred |
+| Horizontal autoscaling (HPA) | **deferred** | atlas exposes load; the autoscaler loop is future work |
+| StatefulSet / DaemonSet / CronJob | **deferred** | only the Deployment kind today |
+| ConfigMaps / volumes | **deferred** | env + secrets cover config; persistent volumes are future work |
+
+Nothing above is faked: deferred items are absent and labelled, not stubbed to look present.
 
 ---
 

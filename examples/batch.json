@@ -1,0 +1,11 @@
+{
+  "name": "batch",
+  "namespace": "jobs",
+  "image": "alpine:3.19",
+  "command": ["sh", "-c", "echo processing && sleep 30"],
+  "replicas": 2,
+  "resources": { "cpu_cores": 1, "mem_mb": 128 },
+  "bid": "1000000000000000000",
+  "duration_secs": 120,
+  "strategy": { "type": "recreate" }
+}

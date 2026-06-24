@@ -8,12 +8,14 @@
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ce_rs::{Amount, AtlasEntry, BidSpec, CeClient};
 
+use crate::protocol::{ProbeReply, ProbeRequest, PROBE_TOPIC};
 use crate::reconcile::{Phase, ReplicaState};
-use crate::spec::Deployment;
+use crate::secrets::SecretStore;
+use crate::spec::{Deployment, Probe};
 
 /// The capabilities the controller needs from the CE mesh. Async, object-safe via `async_trait`-free
 /// manual desugaring is avoided by using `impl Future` returns through a small wrapper; instead we
@@ -41,12 +43,25 @@ pub trait MeshDriver: Send + Sync {
         grant: Option<&str>,
     ) -> impl std::future::Future<Output = Result<()>> + Send;
 
-    /// Current phase of `job_id` (from the host's job status), if known.
+    /// Current phase of `job_id`, optionally running `probe` inside the cell on `node_id`. The
+    /// driver should consult the host's authoritative view (and the probe) rather than only the
+    /// local payer's cached job record. `probe` of `None` means status-only.
     fn phase(
         &self,
         node_id: &str,
         job_id: &str,
+        probe: Option<&Probe>,
+        grant: Option<&str>,
     ) -> impl std::future::Future<Output = Result<Phase>> + Send;
+
+    /// Advertise that `service` is provided by this orchestrator's node (DHT discovery). Default is
+    /// a no-op so fakes need not implement it.
+    fn advertise_service(
+        &self,
+        _service: &str,
+    ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
 }
 
 /// A real CE-backed driver: every method is a thin call over [`CeClient`] (the SDK).
@@ -54,28 +69,55 @@ pub struct CeDriver {
     ce: CeClient,
     /// Freshness window for atlas entries (seconds); 0 disables.
     pub max_stale_secs: u64,
+    /// Secret store used to resolve `value_from` env vars at deploy time. Empty = none.
+    secrets: Arc<SecretStore>,
+    /// Per-probe mesh request timeout (ms).
+    pub probe_timeout_ms: u64,
 }
 
 impl CeDriver {
     /// Build a driver over a CE node at `base_url` (uses the node's discovered API token).
     pub fn new(base_url: impl Into<String>) -> Self {
-        CeDriver { ce: CeClient::new(base_url), max_stale_secs: 120 }
+        CeDriver {
+            ce: CeClient::new(base_url),
+            max_stale_secs: 120,
+            secrets: Arc::new(SecretStore::default()),
+            probe_timeout_ms: 5_000,
+        }
     }
 
     /// Build a driver over an existing client (e.g. with an explicit token).
     pub fn with_client(ce: CeClient) -> Self {
-        CeDriver { ce, max_stale_secs: 120 }
+        CeDriver {
+            ce,
+            max_stale_secs: 120,
+            secrets: Arc::new(SecretStore::default()),
+            probe_timeout_ms: 5_000,
+        }
     }
 
-    fn bid_spec(d: &Deployment) -> BidSpec {
-        BidSpec {
+    /// Attach a secret store for resolving `value_from` env vars.
+    pub fn with_secrets(mut self, secrets: SecretStore) -> Self {
+        self.secrets = Arc::new(secrets);
+        self
+    }
+
+    /// Access the underlying SDK client (for status/balance/preflight queries).
+    pub fn client(&self) -> &CeClient {
+        &self.ce
+    }
+
+    fn bid_spec(&self, d: &Deployment) -> Result<BidSpec> {
+        let secrets = Arc::clone(&self.secrets);
+        let cmd = d.effective_command(&move |name| secrets.get(name).map(|s| s.to_string()))?;
+        Ok(BidSpec {
             image: d.image.clone(),
-            cmd: d.command.clone(),
+            cmd,
             cpu_cores: d.resources.cpu_cores,
             mem_mb: d.resources.mem_mb,
             duration_secs: d.duration_secs,
             bid: d.bid,
-        }
+        })
     }
 }
 
@@ -85,7 +127,7 @@ impl MeshDriver for CeDriver {
     }
 
     async fn deploy(&self, node_id: &str, d: &Deployment, grant: Option<&str>) -> Result<String> {
-        let spec = Self::bid_spec(d);
+        let spec = self.bid_spec(d)?;
         self.ce.mesh_deploy(node_id, &spec, grant).await
     }
 
@@ -93,10 +135,41 @@ impl MeshDriver for CeDriver {
         self.ce.mesh_kill(node_id, job_id, grant).await
     }
 
-    async fn phase(&self, _node_id: &str, job_id: &str) -> Result<Phase> {
-        // We track jobs the orchestrator placed; the local node knows their status (it is the payer).
+    async fn phase(
+        &self,
+        node_id: &str,
+        job_id: &str,
+        probe: Option<&Probe>,
+        grant: Option<&str>,
+    ) -> Result<Phase> {
+        // Ask the host's `ce-gke serve` agent for the authoritative job phase (and run the probe in
+        // the cell, if any). If the host runs no agent (request times out / errors), fall back to
+        // the payer's local job record — strictly worse but never a hard failure.
+        let req = ProbeRequest {
+            job_id: job_id.to_string(),
+            check_command: probe.map(|p| p.check_command()).unwrap_or_default(),
+            grant: grant.map(|s| s.to_string()),
+        };
+        match req.encode() {
+            Ok(payload) => {
+                match self.ce.request(node_id, PROBE_TOPIC, &payload, self.probe_timeout_ms).await {
+                    Ok(bytes) => {
+                        if let Ok(reply) = ProbeReply::decode(&bytes) {
+                            return Ok(reply.effective_phase());
+                        }
+                        // Garbled reply → fall through to local fallback.
+                    }
+                    Err(_) => { /* no agent / timeout → local fallback */ }
+                }
+            }
+            Err(_) => { /* should not happen for a tiny request */ }
+        }
         let job = self.ce.job(job_id).await?;
         Ok(Phase::from_job_status(&job.status))
+    }
+
+    async fn advertise_service(&self, service: &str) -> Result<()> {
+        self.ce.advertise_service(service).await
     }
 }
 
@@ -118,6 +191,10 @@ struct FakeState {
     kill_fails: Vec<String>,
     /// If set, the next `deploy` returns this error then clears (one-shot 5xx).
     deploy_fail_once: bool,
+    /// Job ids whose liveness/readiness probe is reported as failing (running-but-unhealthy).
+    probe_fails: Vec<String>,
+    /// Service names advertised via [`MeshDriver::advertise_service`].
+    advertised: Vec<String>,
 }
 
 impl FakeDriver {
@@ -131,8 +208,20 @@ impl FakeDriver {
                 deploy_fails: Vec::new(),
                 kill_fails: Vec::new(),
                 deploy_fail_once: false,
+                probe_fails: Vec::new(),
+                advertised: Vec::new(),
             }),
         }
+    }
+
+    /// Make `job_id`'s probe report Failed even when its host status is Running (deadlocked cell).
+    pub fn fail_probe_on(&self, job_id: &str) {
+        self.inner.lock().expect("lock").probe_fails.push(job_id.to_string());
+    }
+
+    /// Services advertised via [`MeshDriver::advertise_service`] so far.
+    pub fn advertised_services(&self) -> Vec<String> {
+        self.inner.lock().expect("lock").advertised.clone()
     }
 
     /// Make every `deploy` on `node_id` fail (models a host that rejects deploys / a dropped peer).
@@ -228,12 +317,30 @@ impl MeshDriver for FakeDriver {
         Ok(())
     }
 
-    async fn phase(&self, _node_id: &str, job_id: &str) -> Result<Phase> {
+    async fn phase(
+        &self,
+        _node_id: &str,
+        job_id: &str,
+        probe: Option<&Probe>,
+        _grant: Option<&str>,
+    ) -> Result<Phase> {
         let s = self.inner.lock().expect("lock");
-        s.jobs
+        let phase = s
+            .jobs
             .get(job_id)
             .map(|(_, p)| *p)
-            .ok_or_else(|| anyhow::anyhow!("unknown job {job_id}"))
+            .ok_or_else(|| anyhow::anyhow!("unknown job {job_id}"))?;
+        // If a probe is requested and this job is marked as failing its probe, report Failed even if
+        // the host status is Running (models a deadlocked-but-running container).
+        if probe.is_some() && s.probe_fails.iter().any(|j| j == job_id) {
+            return Ok(Phase::Failed);
+        }
+        Ok(phase)
+    }
+
+    async fn advertise_service(&self, service: &str) -> Result<()> {
+        self.inner.lock().expect("lock").advertised.push(service.to_string());
+        Ok(())
     }
 }
 
@@ -268,6 +375,7 @@ mod tests {
             bid: Amount::from_credits(1),
             duration_secs: 60,
             strategy: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -276,10 +384,10 @@ mod tests {
         let fake = FakeDriver::new(vec![host("a", 8, 8192)]);
         let d = deploy();
         let job = fake.deploy("a", &d, None).await.unwrap();
-        assert_eq!(fake.phase("a", &job).await.unwrap(), Phase::Pending);
+        assert_eq!(fake.phase("a", &job, None, None).await.unwrap(), Phase::Pending);
         assert_eq!(fake.count_phase(Phase::Pending), 1);
         fake.kill("a", &job, None).await.unwrap();
-        assert!(fake.phase("a", &job).await.is_err(), "killed job is gone");
+        assert!(fake.phase("a", &job, None, None).await.is_err(), "killed job is gone");
     }
 
     #[tokio::test]
@@ -310,7 +418,7 @@ mod tests {
         fake.fail_kill_on(&job);
         assert!(fake.kill("a", &job, None).await.is_err());
         // job still tracked (kill failed → controller must retry)
-        assert!(fake.phase("a", &job).await.is_ok());
+        assert!(fake.phase("a", &job, None, None).await.is_ok());
     }
 
     #[tokio::test]
@@ -319,7 +427,7 @@ mod tests {
         let d = deploy();
         let job = fake.deploy("a", &d, None).await.unwrap();
         fake.set_phase(&job, Phase::Failed);
-        assert_eq!(fake.phase("a", &job).await.unwrap(), Phase::Failed);
+        assert_eq!(fake.phase("a", &job, None, None).await.unwrap(), Phase::Failed);
     }
 
     #[tokio::test]

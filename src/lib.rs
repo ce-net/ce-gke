@@ -24,7 +24,22 @@
 //!   deterministic [`FakeDriver`] for failure-injection tests.
 //! - [`controller`] — one reconcile [`tick`](controller::Controller::tick) wiring the pure planners
 //!   to a driver; [`converge`](controller::Controller::converge) drives it to a fixed point.
-//! - [`auth`] — build/verify the capability chain authorizing deploys on hosts.
+//! - [`daemon`] — the long-running [`run_daemon`](daemon::run_daemon) loop: reconcile the whole fleet
+//!   forever (real self-healing), with graceful shutdown.
+//! - [`auth`] — build/verify the capability chain authorizing deploys/kills/probes on hosts.
+//! - [`protocol`] / [`serve`] — the host-side health-probe protocol and agent.
+//! - [`secrets`] — local secret store for `value_from` env vars (kept out of manifests/state).
+//!
+//! ## What this is and is not (vs GKE)
+//!
+//! Implemented: declarative Deployments, atlas-ranked placement with spread + host fallback, rolling
+//! update / recreate, steady-state self-healing, a continuous reconcile **daemon**, namespaces,
+//! revision history + `rollout undo`/`pause`/`resume`, liveness/readiness probes (host-agent +
+//! status fallback), env vars + secret refs, named-service advertisement on the DHT, capability
+//! preflight + balance pre-check, atomic + locked state. Deferred (documented, not faked): a
+//! container-exec data plane for in-cell probe commands (the protocol carries them; the agent fills
+//! `probe_passed` only where a sidecar exists), HPA autoscaling, Service load-balancing beyond
+//! discovery, and StatefulSet/DaemonSet/CronJob workload kinds. See the README for the full matrix.
 //!
 //! ## Example
 //!
@@ -46,16 +61,24 @@
 
 pub mod auth;
 pub mod controller;
+pub mod daemon;
 pub mod driver;
 pub mod placement;
+pub mod protocol;
 pub mod reconcile;
 pub mod rollout;
+pub mod secrets;
+pub mod serve;
 pub mod spec;
 pub mod state;
 
 pub use controller::{Controller, TickReport};
+pub use daemon::{run_daemon, DaemonConfig};
 pub use driver::{CeDriver, FakeDriver, MeshDriver};
 pub use placement::{rank, Candidate};
+pub use protocol::{ProbeReply, ProbeRequest, PROBE_TOPIC};
 pub use reconcile::{reconcile, Phase, Plan, ReplicaState};
 pub use rollout::{plan_step, RolloutStep};
-pub use spec::{Deployment, Resources, Strategy};
+pub use secrets::SecretStore;
+pub use spec::{Deployment, EnvVar, Probe, ProbeKind, Resources, Strategy};
+pub use state::{ManagedDeployment, StateLock, Store};
