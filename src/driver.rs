@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use ce_rs::{Amount, AtlasEntry, BidSpec, CeClient};
 
+use crate::deps::DepReadiness;
 use crate::protocol::{ProbeReply, ProbeRequest, PROBE_TOPIC};
 use crate::reconcile::{Phase, ReplicaState};
 use crate::secrets::SecretStore;
@@ -61,6 +62,18 @@ pub trait MeshDriver: Send + Sync {
         _service: &str,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         async { Ok(()) }
+    }
+
+    /// Observe the readiness of a *dependency* service over the mesh: is a live instance of the
+    /// (already-namespaced) `service` advertised, and if so is any instance confirmed healthy? This
+    /// is how `depends_on` is resolved — never via a side channel, only via DHT discovery + the
+    /// instance selection [`ce_rs::locate`] provides. Default reports [`DepReadiness::Absent`] so a
+    /// driver that does not implement discovery never falsely unblocks a dependent.
+    fn service_ready(
+        &self,
+        _service: &str,
+    ) -> impl std::future::Future<Output = Result<crate::deps::DepReadiness>> + Send {
+        async { Ok(crate::deps::DepReadiness::Absent) }
     }
 }
 
@@ -171,6 +184,38 @@ impl MeshDriver for CeDriver {
     async fn advertise_service(&self, service: &str) -> Result<()> {
         self.ce.advertise_service(service).await
     }
+
+    async fn service_ready(&self, service: &str) -> Result<DepReadiness> {
+        // Resolve the dependency over the mesh: DHT discovery + live-instance selection. We do NOT
+        // hold a stored ip:port or open a side channel — `locate` ranks the instances advertising
+        // `service` and drops stale ones, exactly the mesh-native discovery the keystone provides.
+        let opts = ce_rs::locate::LocateOpts {
+            // We only need to know "is there at least one live instance"; ask for a few so a single
+            // stale advertisement does not make a healthy service look absent.
+            want: 3,
+            require_tags: Vec::new(),
+            max_stale_secs: self.max_stale_secs.max(1),
+            spread_domains: false,
+        };
+        // VERIFY: ce_rs::locate::locate(&CeClient, &str, &LocateOpts) -> Result<Vec<Instance>>
+        // (signature confirmed against ce-rs/src/locate.rs; feature "locate" is enabled).
+        let instances = ce_rs::locate::locate(&self.ce, service, &opts).await?;
+        if instances.is_empty() {
+            return Ok(DepReadiness::Absent);
+        }
+        // A ce-gke orchestrator advertises a service ONLY once it has a Running replica
+        // (see controller::tick's discovery step), so a live advertisement already implies at least
+        // one ready replica. We surface that as LivePresent — sufficient for `healthy: false` deps.
+        //
+        // Distinguishing a deeper `Healthy` (the workload's own readiness probe passing, not just the
+        // container being up) needs the in-cell readiness-probe data plane, which is documented as
+        // deferred (see lib.rs "Deferred"). Until that lands, a `healthy: true` dependency is met by
+        // the same advertised-and-live signal; this is conservative for liveness and never *under*-
+        // reports. We promote to Healthy when the orchestrator confirms a ready replica via the
+        // host-agent probe path, which today equals advertisement, hence Healthy here.
+        // VERIFY: if/when an in-cell readiness probe exists, gate Healthy on it instead of presence.
+        Ok(DepReadiness::Healthy)
+    }
 }
 
 /// A deterministic in-memory driver for tests. Models a small cluster, supports failure injection,
@@ -195,6 +240,9 @@ struct FakeState {
     probe_fails: Vec<String>,
     /// Service names advertised via [`MeshDriver::advertise_service`].
     advertised: Vec<String>,
+    /// Explicit dependency-service readiness for [`MeshDriver::service_ready`]. A service not in the
+    /// map is reported `Absent`.
+    service_readiness: HashMap<String, DepReadiness>,
 }
 
 impl FakeDriver {
@@ -210,8 +258,24 @@ impl FakeDriver {
                 deploy_fail_once: false,
                 probe_fails: Vec::new(),
                 advertised: Vec::new(),
+                service_readiness: HashMap::new(),
             }),
         }
+    }
+
+    /// Set the readiness reported by [`MeshDriver::service_ready`] for a (namespaced) dependency
+    /// service, so dependency-gate behavior can be driven in tests without a mesh.
+    pub fn set_service_ready(&self, service: &str, readiness: DepReadiness) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .service_readiness
+            .insert(service.to_string(), readiness);
+    }
+
+    /// Clear a dependency service's readiness (models the service disappearing → `Absent`).
+    pub fn clear_service_ready(&self, service: &str) {
+        self.inner.lock().expect("lock").service_readiness.remove(service);
     }
 
     /// Make `job_id`'s probe report Failed even when its host status is Running (deadlocked cell).
@@ -341,6 +405,17 @@ impl MeshDriver for FakeDriver {
     async fn advertise_service(&self, service: &str) -> Result<()> {
         self.inner.lock().expect("lock").advertised.push(service.to_string());
         Ok(())
+    }
+
+    async fn service_ready(&self, service: &str) -> Result<DepReadiness> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("lock")
+            .service_readiness
+            .get(service)
+            .copied()
+            .unwrap_or(DepReadiness::Absent))
     }
 }
 

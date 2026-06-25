@@ -62,6 +62,7 @@
 pub mod auth;
 pub mod controller;
 pub mod daemon;
+pub mod deps;
 pub mod driver;
 pub mod placement;
 pub mod protocol;
@@ -70,15 +71,18 @@ pub mod rollout;
 pub mod secrets;
 pub mod serve;
 pub mod spec;
+pub mod stack;
 pub mod state;
 
 pub use controller::{Controller, TickReport};
 pub use daemon::{run_daemon, DaemonConfig};
+pub use deps::{DepReadiness, Gate};
 pub use driver::{CeDriver, FakeDriver, MeshDriver};
 pub use placement::{rank, Candidate};
 pub use protocol::{ProbeReply, ProbeRequest, PROBE_TOPIC};
 pub use reconcile::{reconcile, Phase, Plan, ReplicaState};
 pub use rollout::{plan_step, RolloutStep};
 pub use secrets::SecretStore;
-pub use spec::{Deployment, EnvVar, Probe, ProbeKind, Resources, Strategy};
+pub use spec::{DependencyRef, Deployment, EnvVar, Probe, ProbeKind, Resources, Strategy};
+pub use stack::{topo_sort, Stack};
 pub use state::{ManagedDeployment, StateLock, Store};

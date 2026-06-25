@@ -279,6 +279,12 @@ async fn preflight_checks(cli: &Cli, driver: &CeDriver, spec: &Deployment) -> Re
 
 async fn apply(cli: &Cli, driver: &CeDriver, store: &mut Store, file: &str) -> Result<()> {
     let manifest = read_manifest(file)?;
+    // A manifest declaring `apps:` is a multi-deployment stack ("docker-compose for the mesh");
+    // anything else is a single Deployment. The stack path topo-sorts by depends_on (rejecting
+    // cycles) and applies producers before consumers.
+    if is_stack_manifest(&manifest) {
+        return apply_stack(cli, driver, store, &manifest).await;
+    }
     let mut spec = Deployment::from_manifest(&manifest)?;
     // The CLI --namespace flag overrides only if the manifest left it at the default.
     if spec.namespace == "default" && cli.namespace != "default" {
@@ -293,6 +299,71 @@ async fn apply(cli: &Cli, driver: &CeDriver, store: &mut Store, file: &str) -> R
     );
     store.upsert(spec, cli.grant.clone());
     reconcile_to_convergence(cli, driver, store, &key).await
+}
+
+/// Does this manifest declare a multi-deployment stack (an `apps:` list) rather than a single
+/// Deployment? Parses leniently as a generic YAML map and checks for the key — never fails the apply
+/// on a malformed manifest (the real parser surfaces the precise error downstream).
+fn is_stack_manifest(manifest: &str) -> bool {
+    match serde_yaml::from_str::<serde_yaml::Value>(manifest) {
+        Ok(serde_yaml::Value::Mapping(m)) => {
+            m.contains_key(serde_yaml::Value::String("apps".to_string()))
+        }
+        _ => false,
+    }
+}
+
+/// Apply a multi-deployment stack: validate the graph (rejecting cycles + dangling deps), then apply
+/// each app in dependency order. Each app is upserted and reconciled; a consumer whose producer is
+/// not yet live is held `waiting` by the per-tick dependency gate and converges on a later pass
+/// (or under `ce-gke run`). The static topo-order gives a sensible first-apply sequence; runtime
+/// correctness comes from the gate, not the order.
+async fn apply_stack(cli: &Cli, driver: &CeDriver, store: &mut Store, manifest: &str) -> Result<()> {
+    let mut stack = ce_gke::stack::Stack::from_manifest(manifest)?;
+    // CLI --namespace applies to apps still at the default namespace (same rule as single apply).
+    if cli.namespace != "default" {
+        for app in &mut stack.apps {
+            if app.namespace == "default" {
+                app.namespace = cli.namespace.clone();
+            }
+        }
+        // Re-validate after the namespace shift (keeps depends_on/service co-namespacing consistent).
+        stack.validate()?;
+    }
+    let order = stack.apply_order()?; // errors here name a dependency cycle
+    println!(
+        "Applying stack: {} app(s) in dependency order: {}",
+        stack.apps.len(),
+        order.iter().map(|k| strip_ns(k)).collect::<Vec<_>>().join(" -> ")
+    );
+    // Index apps by key so we can apply in topo order.
+    let mut by_key: std::collections::HashMap<String, Deployment> =
+        stack.apps.into_iter().map(|a| (a.key(), a)).collect();
+    for key in &order {
+        let Some(spec) = by_key.remove(key) else { continue };
+        spec.validate()?;
+        preflight_checks(cli, driver, &spec).await?;
+        println!(
+            "Applying '{}' (image {}, {} replica(s){})",
+            key,
+            spec.image,
+            spec.replicas,
+            if spec.depends_on.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", depends_on: {}",
+                    spec.depends_on.iter().map(|d| d.service.clone()).collect::<Vec<_>>().join(",")
+                )
+            }
+        );
+        store.upsert(spec, cli.grant.clone());
+        reconcile_to_convergence(cli, driver, store, key).await?;
+    }
+    println!(
+        "Stack applied. Run `ce-gke run` to keep dependents reconciling as their dependencies come up."
+    );
+    Ok(())
 }
 
 async fn scale<D: MeshDriver>(
@@ -438,6 +509,7 @@ async fn reconcile_to_convergence<D: MeshDriver>(
     let spec = managed.spec.clone();
 
     let mut converged = false;
+    let mut last_waiting: Vec<String> = Vec::new();
     for tick in 0..cli.max_ticks {
         let report = ctrl.tick(driver, &spec).await?;
         if let Some(m) = store.get_mut(key) {
@@ -453,6 +525,16 @@ async fn reconcile_to_convergence<D: MeshDriver>(
                 fail_note("place", report.place_failures),
                 fail_note("kill", report.kill_failures),
             );
+        }
+        // Surface a dependency hold only when it changes, so the loop does not spam the same line.
+        if report.waiting_on != last_waiting {
+            if report.is_waiting() {
+                println!(
+                    "  tick {tick}: waiting on dependency service(s): {}",
+                    report.waiting_on.join(", ")
+                );
+            }
+            last_waiting = report.waiting_on.clone();
         }
         if report.done {
             converged = true;

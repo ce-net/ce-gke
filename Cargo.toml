@@ -23,7 +23,9 @@ path = "src/main.rs"
 [dependencies]
 # The CE SDK: atlas/history (placement), mesh-deploy/mesh-kill (directed placement), jobs (status),
 # blobs, payment channels, content-addressing. Money is u128 base units, decimal strings on the wire.
-ce-rs = { path = "../ce-rs" }
+# `locate` enables ce_rs::locate: mesh-native service discovery + live-instance selection, used to
+# resolve `depends_on` dependencies over the DHT (never a side channel or stored ip:port).
+ce-rs = { path = "../ce-rs", features = ["locate"] }
 # The capability verifier primitive — a deploy is authorized by a signed attenuating chain that the
 # host honors; the orchestrator forwards the grant token on every mesh-deploy/kill.
 ce-cap = { path = "../ce/crates/ce-cap" }

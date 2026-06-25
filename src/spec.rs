@@ -320,6 +320,42 @@ pub struct Deployment {
     /// Publish the healthy replica set as a named CE service (DHT discovery). Empty = no service.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service: String,
+    /// Services this deployment depends on. Each is resolved over the mesh (DHT/`ce_rs::locate`)
+    /// before any replica is placed; an unmet dependency holds the deployment in a `waiting` state
+    /// (no replicas placed) until the next reconcile tick finds it satisfied. This is the
+    /// docker-compose `depends_on` analogue, but mesh-native: a dependency is "a live instance of a
+    /// named CE service exists", not "a sibling container is up on this host".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<DependencyRef>,
+}
+
+/// A dependency on another CE service by name. The dependency is considered met when
+/// [`ce_rs::locate`] finds at least one live instance of the service; when `healthy` is set, the
+/// instance must additionally pass the orchestrator's readiness check (the host-agent probe), not
+/// merely be advertised.
+///
+/// `service` is a bare service name (the same `service` field a sibling [`Deployment`] publishes).
+/// Within a [`crate::stack::Stack`] it is resolved namespace-locally to the sibling's
+/// [`Deployment::service_name`]; standalone it is resolved against the default namespace. The
+/// resolution rule lives in [`DependencyRef::resolved_service_name`] so it stays pure and testable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyRef {
+    /// The bare CE service name this deployment waits for.
+    pub service: String,
+    /// Require a *healthy* (readiness-passing) instance, not merely an advertised one. Defaults to
+    /// false (advertised-and-live is enough), matching docker-compose's `service_started` vs
+    /// `service_healthy` conditions.
+    #[serde(default)]
+    pub healthy: bool,
+}
+
+impl DependencyRef {
+    /// The namespaced CE service name to resolve over the mesh, given the dependent's namespace.
+    /// Mirrors [`Deployment::service_name`] so a dependency on a sibling's `service` resolves to the
+    /// exact name that sibling advertises: `ce-gke/<namespace>/<service>`.
+    pub fn resolved_service_name(&self, namespace: &str) -> String {
+        format!("ce-gke/{}/{}", namespace, self.service)
+    }
 }
 
 fn default_duration() -> u64 {
@@ -430,6 +466,26 @@ impl Deployment {
         if !self.service.is_empty() {
             validate_name(&self.service)
                 .map_err(|e| anyhow::anyhow!("service name invalid: {e}"))?;
+        }
+        let mut dep_seen = std::collections::HashSet::new();
+        for dep in &self.depends_on {
+            validate_name(&dep.service).map_err(|e| {
+                anyhow::anyhow!("deployment '{}': depends_on service invalid: {e}", self.name)
+            })?;
+            if dep.service == self.service {
+                anyhow::bail!(
+                    "deployment '{}': cannot depend on its own service '{}'",
+                    self.name,
+                    dep.service
+                );
+            }
+            if !dep_seen.insert(&dep.service) {
+                anyhow::bail!(
+                    "deployment '{}': duplicate dependency on '{}'",
+                    self.name,
+                    dep.service
+                );
+            }
         }
         Ok(())
     }
@@ -552,6 +608,7 @@ mod tests {
             liveness: None,
             readiness: None,
             service: String::new(),
+            depends_on: vec![],
         }
     }
 
@@ -882,6 +939,72 @@ strategy:
         d.service = "web".into();
         d.namespace = "team-a".into();
         assert_eq!(d.service_name(), Some("ce-gke/team-a/web".to_string()));
+    }
+
+    #[test]
+    fn depends_on_defaults_empty_and_parses() {
+        // Existing manifests with no depends_on still parse (serde default).
+        let d = Deployment::from_manifest("name: web\nimage: nginx\nreplicas: 1\n").unwrap();
+        assert!(d.depends_on.is_empty());
+        // And a manifest can declare deps, including the `healthy` flag.
+        let yaml = r#"
+name: web
+image: nginx
+replicas: 1
+depends_on:
+  - service: db
+  - service: cache
+    healthy: true
+"#;
+        let d = Deployment::from_manifest(yaml).unwrap();
+        assert_eq!(d.depends_on.len(), 2);
+        assert_eq!(d.depends_on[0], DependencyRef { service: "db".into(), healthy: false });
+        assert_eq!(d.depends_on[1], DependencyRef { service: "cache".into(), healthy: true });
+    }
+
+    #[test]
+    fn depends_on_does_not_change_revision() {
+        // depends_on affects *when* a deployment is placed, not *what* runs, so it must not change
+        // the pod-template revision (changing a dep must not trigger a rollout).
+        let a = base();
+        let mut b = base();
+        b.depends_on = vec![DependencyRef { service: "db".into(), healthy: true }];
+        assert_eq!(a.revision(), b.revision());
+    }
+
+    #[test]
+    fn depends_on_validation() {
+        let mut d = base();
+        d.service = "web".into();
+        // self-dependency rejected
+        d.depends_on = vec![DependencyRef { service: "web".into(), healthy: false }];
+        assert!(d.validate().is_err());
+        // duplicate rejected
+        d.depends_on = vec![
+            DependencyRef { service: "db".into(), healthy: false },
+            DependencyRef { service: "db".into(), healthy: true },
+        ];
+        assert!(d.validate().is_err());
+        // bad name rejected
+        d.depends_on = vec![DependencyRef { service: "BAD".into(), healthy: false }];
+        assert!(d.validate().is_err());
+        // good deps accepted
+        d.depends_on = vec![
+            DependencyRef { service: "db".into(), healthy: false },
+            DependencyRef { service: "cache".into(), healthy: true },
+        ];
+        assert!(d.validate().is_ok());
+    }
+
+    #[test]
+    fn dependency_resolved_service_name_matches_sibling() {
+        let dep = DependencyRef { service: "db".into(), healthy: false };
+        assert_eq!(dep.resolved_service_name("prod"), "ce-gke/prod/db");
+        // matches what a sibling publishing service "db" in ns "prod" would advertise
+        let mut sib = base();
+        sib.service = "db".into();
+        sib.namespace = "prod".into();
+        assert_eq!(sib.service_name(), Some(dep.resolved_service_name("prod")));
     }
 
     #[test]

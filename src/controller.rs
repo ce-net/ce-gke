@@ -11,6 +11,7 @@
 
 use anyhow::Result;
 
+use crate::deps::{DepReadiness, Gate};
 use crate::driver::MeshDriver;
 use crate::placement::rank;
 use crate::reconcile::{Phase, ReplicaState};
@@ -54,12 +55,21 @@ pub struct TickReport {
     pub service_advertised: bool,
     /// True when the deployment is fully reconciled on its target revision.
     pub done: bool,
+    /// When the deployment is held by an unmet [`depends_on`](crate::spec::Deployment::depends_on),
+    /// the bare service names it is waiting on (sorted). Empty when not waiting. While waiting, no
+    /// new replicas are placed and the named service is not advertised.
+    pub waiting_on: Vec<String>,
 }
 
 impl TickReport {
     /// Did this tick change anything?
     pub fn made_progress(&self) -> bool {
         !self.placed.is_empty() || !self.killed.is_empty()
+    }
+
+    /// Is the deployment held waiting on an unmet dependency this tick?
+    pub fn is_waiting(&self) -> bool {
+        !self.waiting_on.is_empty()
     }
 }
 
@@ -116,6 +126,28 @@ impl Controller {
         self.refresh_failures.retain(|k, _| live.contains(k));
     }
 
+    /// Resolve every `depends_on` of `d` over the mesh (via the driver's `service_ready`, backed by
+    /// `ce_rs::locate`) and fold the observations into the pure [`Gate`] decision. The mesh lookups
+    /// are gathered first into a readiness map (keyed by bare service name), then [`Gate::evaluate`]
+    /// — which is pure — makes the ready/waiting call. A lookup that errors is treated as `Absent`
+    /// (fail-safe: an unresolvable dependency holds the dependent rather than racing it up).
+    async fn evaluate_deps<D: MeshDriver>(&self, driver: &D, d: &Deployment) -> Gate {
+        if d.depends_on.is_empty() {
+            return Gate::Ready;
+        }
+        let mut readiness: std::collections::HashMap<String, DepReadiness> =
+            std::collections::HashMap::new();
+        for dep in &d.depends_on {
+            let resolved = dep.resolved_service_name(&d.namespace);
+            let observed = driver
+                .service_ready(&resolved)
+                .await
+                .unwrap_or(DepReadiness::Absent);
+            readiness.insert(dep.service.clone(), observed);
+        }
+        Gate::evaluate(d, |svc| readiness.get(svc).copied().unwrap_or(DepReadiness::Absent))
+    }
+
     /// Run one reconcile tick for `d`. Steps:
     /// 1. refresh phases (health),
     /// 2. plan the next rolling-update step against `d.revision()`,
@@ -130,9 +162,19 @@ impl Controller {
         // 1. Health refresh (with bounded retry + liveness probe).
         self.refresh(driver, d).await;
 
+        // 1b. Dependency gate: resolve each `depends_on` over the mesh and decide ready vs waiting.
+        // This is the "docker-compose for the mesh" layer — a deployment whose deps are unmet places
+        // nothing this tick and reports `waiting_on`; the next tick retries. When a dep disappears,
+        // the per-tick resolution flips it back to waiting (no special teardown path needed). The
+        // *decision* is the pure `Gate`; only the readiness observation touches the mesh.
+        let gate = self.evaluate_deps(driver, d).await;
+        if let Gate::Waiting { unmet } = &gate {
+            report.waiting_on = unmet.clone();
+        }
+
         // 2. Plan.
         let step: RolloutStep = plan_step(d, &self.replicas, &target);
-        report.done = step.done;
+        report.done = step.done && gate.is_ready();
 
         // 3. Kills first (frees capacity for surge placements; matches Recreate's drain-then-fill).
         for job_id in &step.to_kill {
@@ -195,8 +237,11 @@ impl Controller {
             }
         }
 
-        // 4. Placements on ranked candidates.
-        if step.to_place > 0 {
+        // 4. Placements on ranked candidates. Suppressed while a dependency is unmet: we never bring
+        // a consumer up before its producer is live on the mesh. Kills above (scale-down / rolled-out
+        // old revisions / reaped failures) still ran — holding a deployment must not strand excess or
+        // dead replicas — but no *new* replica is placed until the gate opens.
+        if step.to_place > 0 && gate.is_ready() {
             let atlas = driver.atlas().await.unwrap_or_default();
             let mut candidates = rank(&atlas, d, now_secs(), self.max_stale_secs);
             let mut to_place = step.to_place;
@@ -247,7 +292,9 @@ impl Controller {
         // because provider records expire. Best-effort: a failure here never fails the tick.
         if let Some(service) = d.service_name() {
             let has_ready = self.replicas.iter().any(|r| r.phase == Phase::Running);
-            if has_ready {
+            // Do not advertise a service whose own dependencies are unmet: a dependent of *this*
+            // service must not see it as live while it is still waiting on its producers.
+            if has_ready && gate.is_ready() {
                 match driver.advertise_service(&service).await {
                     Ok(()) => report.service_advertised = true,
                     Err(_) => report.service_advertised = false,
@@ -553,6 +600,101 @@ mod tests {
         ctrl.max_stale_secs = 0;
         ctrl.converge(&fake, &d, 5, |f| f.mark_all_ready()).await.unwrap();
         assert!(fake.advertised_services().is_empty());
+    }
+
+    fn deploy_with_deps(replicas: u32, deps: &[(&str, bool)]) -> Deployment {
+        let mut d = deploy(replicas, Strategy::default());
+        d.namespace = "default".into();
+        d.depends_on = deps
+            .iter()
+            .map(|(s, h)| crate::spec::DependencyRef { service: (*s).into(), healthy: *h })
+            .collect();
+        d
+    }
+
+    #[tokio::test]
+    async fn waiting_on_unmet_dependency_places_nothing() {
+        let fake = FakeDriver::new(vec![host("a", 16, 16384), host("b", 16, 16384)]);
+        let d = deploy_with_deps(2, &[("db", false)]);
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        // db is not advertised -> the deployment is held waiting, nothing placed.
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r.is_waiting());
+        assert_eq!(r.waiting_on, vec!["db".to_string()]);
+        assert!(r.placed.is_empty());
+        assert!(!r.done);
+        assert_eq!(ctrl.current().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dependency_becoming_ready_unblocks_placement() {
+        let fake = FakeDriver::new(vec![host("a", 16, 16384), host("b", 16, 16384)]);
+        let d = deploy_with_deps(2, &[("db", false)]);
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        // tick 1: waiting.
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r.is_waiting());
+        // db comes up (its orchestrator advertises the namespaced service name).
+        fake.set_service_ready("ce-gke/default/db", crate::deps::DepReadiness::LivePresent);
+        // tick 2: gate open -> places.
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(!r.is_waiting());
+        assert_eq!(r.placed.len(), 2);
+        assert_eq!(ctrl.current().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn healthy_required_dep_waits_until_healthy() {
+        let fake = FakeDriver::new(vec![host("a", 16, 16384)]);
+        let d = deploy_with_deps(1, &[("db", true)]); // requires healthy
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        // db merely present -> still waiting (healthy required).
+        fake.set_service_ready("ce-gke/default/db", crate::deps::DepReadiness::LivePresent);
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r.is_waiting());
+        assert!(r.placed.is_empty());
+        // db healthy -> unblocked.
+        fake.set_service_ready("ce-gke/default/db", crate::deps::DepReadiness::Healthy);
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(!r.is_waiting());
+        assert_eq!(r.placed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dependency_disappearing_sends_dependent_back_to_waiting() {
+        let fake = FakeDriver::new(vec![host("a", 16, 16384)]);
+        let d = deploy_with_deps(1, &[("db", false)]);
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        fake.set_service_ready("ce-gke/default/db", crate::deps::DepReadiness::LivePresent);
+        ctrl.tick(&fake, &d).await.unwrap();
+        fake.mark_all_ready();
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(!r.is_waiting());
+        assert_eq!(ctrl.current().len(), 1);
+        // db disappears -> next tick reports waiting again (placement gated). Existing replica is not
+        // torn down by the gate (steady-state self-healing is unchanged).
+        fake.clear_service_ready("ce-gke/default/db");
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(r.is_waiting());
+        assert_eq!(r.waiting_on, vec!["db".to_string()]);
+        assert!(r.placed.is_empty());
+        assert_eq!(ctrl.current().len(), 1, "gate does not tear down running replicas");
+    }
+
+    #[tokio::test]
+    async fn no_deps_behaves_exactly_as_before() {
+        // A deployment without depends_on must take the unchanged fast path (always ready).
+        let fake = FakeDriver::new(vec![host("a", 16, 16384), host("b", 16, 16384)]);
+        let d = deploy(2, Strategy::default());
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert!(!r.is_waiting());
+        assert_eq!(r.placed.len(), 2);
     }
 
     #[tokio::test]
