@@ -18,6 +18,12 @@ use crate::reconcile::Phase;
 /// The mesh request/reply topic the health agent answers on.
 pub const PROBE_TOPIC: &str = "ce-gke/probe/1";
 
+/// The mesh request/reply topic on which a host serves its **stable attestation** (the org-root cap
+/// designating it a stable host). Distinct from the probe topic: an attestation is public (the
+/// whole point is to advertise org-root vetting), needs no grant, and is queried for *candidate*
+/// hosts before any replica is placed.
+pub const STABLE_TOPIC: &str = "ce-gke/stable/1";
+
 /// Hard cap on an encoded probe request or reply (defense against a hostile/huge payload). Probe
 /// messages are tiny; 64 KiB is generous and bounds memory on both ends.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -104,9 +110,72 @@ impl ProbeReply {
     }
 }
 
+/// A query asking a host to present its stable attestation. Empty body (the requested node is the
+/// peer being asked); kept as a struct so the protocol can grow without a wire break.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestQuery {}
+
+impl AttestQuery {
+    /// Encode to bounded bincode bytes.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let bytes = bincode::serialize(self)?;
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            bail!("attest query too large ({} bytes)", bytes.len());
+        }
+        Ok(bytes)
+    }
+
+    /// Decode bounded bincode bytes.
+    pub fn decode(bytes: &[u8]) -> Result<AttestQuery> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            bail!("attest query exceeds {MAX_MESSAGE_BYTES} bytes");
+        }
+        Ok(bincode::deserialize(bytes)?)
+    }
+}
+
+/// A host's reply to an [`AttestQuery`]: the hex token of the stable attestation it holds, if any.
+/// The orchestrator never trusts this blindly — it verifies the token offline against the pinned
+/// org-root pubkey ([`crate::stable::verify_stable`]) before counting the host as stable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestReply {
+    /// The org-root stable attestation token (hex `ce-cap` chain). `None` = host is not attested.
+    #[serde(default)]
+    pub attestation: Option<String>,
+}
+
+impl AttestReply {
+    /// Encode to bounded bincode bytes.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let bytes = bincode::serialize(self)?;
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            bail!("attest reply too large ({} bytes)", bytes.len());
+        }
+        Ok(bytes)
+    }
+
+    /// Decode bounded bincode bytes.
+    pub fn decode(bytes: &[u8]) -> Result<AttestReply> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            bail!("attest reply exceeds {MAX_MESSAGE_BYTES} bytes");
+        }
+        Ok(bincode::deserialize(bytes)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attest_query_and_reply_roundtrip() {
+        let q = AttestQuery::default();
+        assert_eq!(AttestQuery::decode(&q.encode().unwrap()).unwrap(), q);
+        let r = AttestReply { attestation: Some("deadbeef".into()) };
+        assert_eq!(AttestReply::decode(&r.encode().unwrap()).unwrap(), r);
+        let none = AttestReply { attestation: None };
+        assert_eq!(AttestReply::decode(&none.encode().unwrap()).unwrap(), none);
+    }
 
     #[test]
     fn request_roundtrip() {

@@ -5,6 +5,17 @@ All notable changes to ce-gke are documented here. This project adheres to seman
 ## [Unreleased]
 
 ### Added
+- **Org-root-attested "stable" host affinity** (`require_stable: true` in a Deployment). A stable
+  attestation is a single `ce-cap` link signed by the offline **org root** (`ce-root`, the key
+  pinned in nodes' `<data_dir>/roots`) that binds a specific NodeId as a stable host (ability
+  `stable`, `Resource::Node(host_id)`). Placement counts a candidate as stable **only** if it
+  presents a valid attestation, verified **offline** against the controller's pinned `--org-root`
+  pubkey via `ce_cap::authorize`; a self-claimed `stable` atlas tag never qualifies. The host serves
+  its attestation over the new `ce-gke/stable/1` mesh topic (the `ce-gke serve` agent reads it from
+  `<data_dir>/ce-gke/stable.token`); the orchestrator collects and verifies candidate attestations
+  before placing. New `ce-gke stable mint <node-id> --root-key <dir>` (run once per stable host) and
+  `ce-gke stable verify`. New `stable` module + `--org-root` global flag. See
+  `docs/stable-attestation.md`.
 - **Long-running controller daemon** (`ce-gke run`): reconciles every managed deployment forever on
   a configurable interval, with graceful SIGINT/SIGTERM shutdown. Real self-healing between commands.
 - **Health probes**: liveness (trips a replica to `Failed`) and readiness, with `exec`/`tcp`/`http`

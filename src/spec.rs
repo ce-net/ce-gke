@@ -298,6 +298,14 @@ pub struct Deployment {
     /// fine. Empty means "any docker host".
     #[serde(default)]
     pub select: Vec<String>,
+    /// Stable affinity: when true, only place replicas on hosts that present a **valid org-root
+    /// stable attestation** for their own NodeId (an org-root-signed `ce-cap` with ability
+    /// `stable`, verified offline against the pinned org-root pubkey — see [`crate::stable`]). A
+    /// host that merely self-claims a `stable` atlas tag, or one with no attestation, does NOT
+    /// qualify. The org root is configured on the controller, not in the manifest, so a manifest
+    /// can never widen which root is trusted. Default false (any docker host).
+    #[serde(default)]
+    pub require_stable: bool,
     /// Max credits to fund each replica (locked at deploy time). Base units, decimal-string on wire.
     #[serde(default)]
     pub bid: Amount,
@@ -601,6 +609,7 @@ mod tests {
             replicas: 3,
             resources: Resources { cpu_cores: 1, mem_mb: 256 },
             select: vec![],
+            require_stable: false,
             bid: Amount::from_credits(5),
             duration_secs: 3600,
             strategy: Strategy::default(),

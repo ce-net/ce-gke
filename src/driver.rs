@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use ce_rs::{Amount, AtlasEntry, BidSpec, CeClient};
 
 use crate::deps::DepReadiness;
-use crate::protocol::{ProbeReply, ProbeRequest, PROBE_TOPIC};
+use crate::protocol::{AttestQuery, AttestReply, ProbeReply, ProbeRequest, PROBE_TOPIC, STABLE_TOPIC};
 use crate::reconcile::{Phase, ReplicaState};
 use crate::secrets::SecretStore;
 use crate::spec::{Deployment, Probe};
@@ -62,6 +62,19 @@ pub trait MeshDriver: Send + Sync {
         _service: &str,
     ) -> impl std::future::Future<Output = Result<()>> + Send {
         async { Ok(()) }
+    }
+
+    /// Fetch a candidate host's **stable attestation token** (the hex `ce-cap` chain it serves), if
+    /// any. Used by the controller before placement to enforce a `require_stable` affinity: the
+    /// controller verifies the returned token offline against the pinned org root (see
+    /// [`crate::stable`]). The host serves its own attestation over the same `ce-gke serve` channel
+    /// the probe uses; a host that has none (or runs no agent) returns `Ok(None)`. Default returns
+    /// `Ok(None)` so a fake/driver without attestation support simply has no stable hosts.
+    fn stable_attestation(
+        &self,
+        _node_id: &str,
+    ) -> impl std::future::Future<Output = Result<Option<String>>> + Send {
+        async { Ok(None) }
     }
 
     /// Observe the readiness of a *dependency* service over the mesh: is a live instance of the
@@ -181,6 +194,21 @@ impl MeshDriver for CeDriver {
         Ok(Phase::from_job_status(&job.status))
     }
 
+    async fn stable_attestation(&self, node_id: &str) -> Result<Option<String>> {
+        // Ask the candidate host's `ce-gke serve` agent for its stable attestation token over the
+        // mesh request/reply primitive. No grant: the attestation is public org-root vouching. A host
+        // with no agent (timeout/error) or no attestation simply yields `None` (not stable).
+        let query = AttestQuery::default();
+        let payload = query.encode()?;
+        match self.ce.request(node_id, STABLE_TOPIC, &payload, self.probe_timeout_ms).await {
+            Ok(bytes) => match AttestReply::decode(&bytes) {
+                Ok(reply) => Ok(reply.attestation),
+                Err(_) => Ok(None),
+            },
+            Err(_) => Ok(None),
+        }
+    }
+
     async fn advertise_service(&self, service: &str) -> Result<()> {
         self.ce.advertise_service(service).await
     }
@@ -243,6 +271,9 @@ struct FakeState {
     /// Explicit dependency-service readiness for [`MeshDriver::service_ready`]. A service not in the
     /// map is reported `Absent`.
     service_readiness: HashMap<String, DepReadiness>,
+    /// node_id -> the stable attestation token that host serves. A node not in the map serves none
+    /// (returns `None` from [`MeshDriver::stable_attestation`]).
+    stable_attestations: HashMap<String, String>,
 }
 
 impl FakeDriver {
@@ -259,8 +290,19 @@ impl FakeDriver {
                 probe_fails: Vec::new(),
                 advertised: Vec::new(),
                 service_readiness: HashMap::new(),
+                stable_attestations: HashMap::new(),
             }),
         }
+    }
+
+    /// Make `node_id` serve `token` as its stable attestation (models a host that holds an org-root
+    /// attestation). The controller still verifies the token offline before trusting it.
+    pub fn set_stable_attestation(&self, node_id: &str, token: &str) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .stable_attestations
+            .insert(node_id.to_string(), token.to_string());
     }
 
     /// Set the readiness reported by [`MeshDriver::service_ready`] for a (namespaced) dependency
@@ -400,6 +442,10 @@ impl MeshDriver for FakeDriver {
             return Ok(Phase::Failed);
         }
         Ok(phase)
+    }
+
+    async fn stable_attestation(&self, node_id: &str) -> Result<Option<String>> {
+        Ok(self.inner.lock().expect("lock").stable_attestations.get(node_id).cloned())
     }
 
     async fn advertise_service(&self, service: &str) -> Result<()> {

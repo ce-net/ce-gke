@@ -24,7 +24,7 @@ use ce_cap::{authorize, decode_chain};
 use ce_identity::NodeId;
 
 use crate::auth::ACTION_PROBE;
-use crate::protocol::{ProbeReply, ProbeRequest};
+use crate::protocol::{AttestQuery, AttestReply, ProbeReply, ProbeRequest};
 use crate::reconcile::Phase;
 
 /// A source of job phase information (the host's own job table). Abstracted for testing.
@@ -118,6 +118,24 @@ pub fn handle_probe_bytes<S: JobSource>(
     let reply = match ProbeRequest::decode(payload) {
         Ok(req) => handle_probe(requester, &req, authority, jobs),
         Err(e) => ProbeReply::failed(format!("bad request: {e}")),
+    };
+    reply.encode()
+}
+
+/// Handle an [`AttestQuery`]: hand back the stable attestation token this host holds (if any). No
+/// authorization — a stable attestation is public org-root vouching, meant to be advertised, and the
+/// orchestrator verifies it offline against the pinned root before trusting it. `held` is the token
+/// the host loaded (e.g. from `<data_dir>/ce-gke/stable.token`); `None` = this host is not attested.
+pub fn handle_attest(_query: &AttestQuery, held: Option<&str>) -> AttestReply {
+    AttestReply { attestation: held.map(|s| s.to_string()) }
+}
+
+/// Decode raw attest-query bytes, handle them, and return encoded reply bytes — the transport seam.
+pub fn handle_attest_bytes(payload: &[u8], held: Option<&str>) -> Result<Vec<u8>> {
+    let reply = match AttestQuery::decode(payload) {
+        Ok(q) => handle_attest(&q, held),
+        // A malformed query gets an empty (not-attested) reply rather than an error channel.
+        Err(_) => AttestReply { attestation: None },
     };
     reply.encode()
 }
@@ -317,5 +335,22 @@ mod tests {
         let auth = authority(&host, 1000, true, &never);
         let reply = handle_probe(&orch.node_id(), &req, &auth, &jobs);
         assert!(reply.detail.contains("invalid job id"));
+    }
+
+    #[test]
+    fn attest_returns_held_token_or_none() {
+        // A host holding an attestation hands it back; one without returns None.
+        let r = handle_attest(&AttestQuery::default(), Some("deadbeef"));
+        assert_eq!(r.attestation.as_deref(), Some("deadbeef"));
+        let r = handle_attest(&AttestQuery::default(), None);
+        assert_eq!(r.attestation, None);
+        // Bytes seam: a well-formed query returns the held token.
+        let q = AttestQuery::default().encode().unwrap();
+        let reply_bytes = handle_attest_bytes(&q, Some("cafe")).unwrap();
+        assert_eq!(AttestReply::decode(&reply_bytes).unwrap().attestation.as_deref(), Some("cafe"));
+        // An oversized payload is rejected by the bounded decode → not-attested reply, never a panic.
+        let oversized = vec![0u8; crate::protocol::MAX_MESSAGE_BYTES + 1];
+        let reply_bytes = handle_attest_bytes(&oversized, Some("deadbeef")).unwrap();
+        assert_eq!(AttestReply::decode(&reply_bytes).unwrap().attestation, None);
     }
 }

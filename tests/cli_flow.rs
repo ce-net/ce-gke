@@ -130,7 +130,7 @@ async fn daemon_pass_heals_across_namespaces() {
 
     // Bring everything up via repeated daemon passes.
     for _ in 0..8 {
-        reconcile_pass(&fake, &mut store, None, None).await;
+        reconcile_pass(&fake, &mut store, None, None, None).await;
         fake.mark_all_ready();
     }
     assert_eq!(store.get("team-a/web").unwrap().replicas.len(), 2);
@@ -140,7 +140,7 @@ async fn daemon_pass_heals_across_namespaces() {
     let victim = store.get("team-a/web").unwrap().replicas[0].job_id.clone();
     fake.set_phase(&victim, Phase::Failed);
     for _ in 0..4 {
-        reconcile_pass(&fake, &mut store, None, None).await;
+        reconcile_pass(&fake, &mut store, None, None, None).await;
         fake.mark_all_ready();
     }
     let reps = &store.get("team-a/web").unwrap().replicas;

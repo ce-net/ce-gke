@@ -11,12 +11,15 @@
 
 use anyhow::Result;
 
+use ce_identity::NodeId;
+
 use crate::deps::{DepReadiness, Gate};
 use crate::driver::MeshDriver;
 use crate::placement::rank;
 use crate::reconcile::{Phase, ReplicaState};
 use crate::rollout::{plan_step, RolloutStep};
 use crate::spec::Deployment;
+use crate::stable::is_stable;
 
 /// How many consecutive failed health refreshes a replica tolerates before it is treated as
 /// `Failed`. A single transient local-API blip must not mark the whole fleet failed and trigger a
@@ -32,6 +35,10 @@ pub struct Controller {
     pub grant: Option<String>,
     /// Freshness window for atlas candidates (seconds); 0 disables.
     pub max_stale_secs: u64,
+    /// The pinned org-root pubkey (NodeId) against which `stable` attestations are verified offline.
+    /// `None` disables stable verification: a `require_stable` deployment then finds NO candidate
+    /// (fail-closed — without a pinned root the orchestrator cannot vouch for any host's stability).
+    pub org_root: Option<NodeId>,
     /// Consecutive refresh failures, per job id. A replica is only marked `Failed` from a refresh
     /// error after this count reaches [`failure_threshold`](Self::failure_threshold) — bounded
     /// retry, so a transient API hiccup never mass-fails the fleet.
@@ -80,9 +87,50 @@ impl Controller {
             replicas: Vec::new(),
             grant,
             max_stale_secs: 120,
+            org_root: None,
             refresh_failures: std::collections::HashMap::new(),
             failure_threshold: DEFAULT_FAILURE_THRESHOLD,
         }
+    }
+
+    /// Pin the org-root pubkey used to verify `stable` attestations (builder-style). Required for any
+    /// deployment with `require_stable: true` to find candidates.
+    pub fn with_org_root(mut self, org_root: NodeId) -> Self {
+        self.org_root = Some(org_root);
+        self
+    }
+
+    /// Build the verified-stable host id set for placement: for each fresh, tag-fitting atlas host,
+    /// fetch the attestation it serves and accept it only if it is a valid org-root stable attestation
+    /// **for that host's own NodeId**, verified offline against the pinned [`org_root`](Self::org_root).
+    /// A self-claimed `stable` atlas tag is never consulted here. Returns an empty set when the
+    /// deployment does not require stability (no work) or when no org root is pinned (fail-closed).
+    async fn verified_stable_ids<D: MeshDriver>(
+        &self,
+        driver: &D,
+        d: &Deployment,
+        atlas: &[ce_rs::AtlasEntry],
+        now: u64,
+    ) -> Vec<String> {
+        if !d.require_stable {
+            return Vec::new();
+        }
+        let Some(org_root) = self.org_root else {
+            // No pinned root → cannot vouch for any host → fail closed (no stable candidates).
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for h in atlas {
+            // The host's id must parse to a NodeId to match the attestation's Resource::Node binding.
+            let Ok(host_id) = parse_node_id(&h.node_id) else { continue };
+            match driver.stable_attestation(&h.node_id).await {
+                Ok(Some(token)) if is_stable(&token, &host_id, &org_root, now) => {
+                    out.push(h.node_id.clone());
+                }
+                _ => { /* no attestation, unparseable, or invalid → not stable */ }
+            }
+        }
+        out
     }
 
     /// Refresh every tracked replica's phase from the driver, running the deployment's liveness
@@ -243,7 +291,11 @@ impl Controller {
         // dead replicas — but no *new* replica is placed until the gate opens.
         if step.to_place > 0 && gate.is_ready() {
             let atlas = driver.atlas().await.unwrap_or_default();
-            let mut candidates = rank(&atlas, d, now_secs(), self.max_stale_secs);
+            let now = now_secs();
+            // For a `require_stable` deployment, verify each host's org-root attestation offline and
+            // pass only the proven-stable ids to placement. Empty (no work) otherwise.
+            let stable_ids = self.verified_stable_ids(driver, d, &atlas, now).await;
+            let mut candidates = rank(&atlas, d, now, self.max_stale_secs, &stable_ids);
             let mut to_place = step.to_place;
             let mut attempts = 0u32;
             // Cap attempts so a cluster that rejects everything terminates instead of looping.
@@ -330,6 +382,16 @@ impl Controller {
     pub fn current(&self) -> &[ReplicaState] {
         &self.replicas
     }
+}
+
+/// Parse an atlas `node_id` hex string into a [`NodeId`] (`[u8; 32]`). The atlas carries node ids as
+/// 64-char hex; an attestation binds a `Resource::Node([u8; 32])`, so we must decode to compare. A
+/// non-hex / wrong-length id yields an error (that host simply cannot be verified-stable).
+fn parse_node_id(s: &str) -> Result<NodeId> {
+    let bytes = hex::decode(s.trim()).map_err(|_| anyhow::anyhow!("node id is not hex"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("node id is not 32 bytes"))
 }
 
 /// Wall-clock seconds (for atlas freshness). Isolated so tests of pure planners never call it.
@@ -708,5 +770,142 @@ mod tests {
         let done = ctrl.converge(&fake, &zero, 10, |f| f.mark_all_ready()).await.unwrap();
         assert!(done.done);
         assert_eq!(ctrl.current().len(), 0);
+    }
+
+    // ---- stable-affinity placement (org-root-attested) ----
+
+    use ce_identity::Identity;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn ident(tag: &str) -> Identity {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("ce-gke-ctrl-{}-{n}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Identity::load_or_generate(&dir).unwrap()
+    }
+
+    fn host_id(id: &Identity, cpu: u32, mem: u32, tags: &[&str]) -> AtlasEntry {
+        AtlasEntry {
+            node_id: id.node_id_hex(),
+            cpu_cores: cpu,
+            mem_mb: mem,
+            running_jobs: 0,
+            last_seen_secs: now_secs(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn stable_deploy(replicas: u32) -> Deployment {
+        let mut d = deploy(replicas, Strategy::default());
+        d.require_stable = true;
+        d
+    }
+
+    #[tokio::test]
+    async fn stable_affinity_selects_only_org_root_attested_host() {
+        let org_root = ident("org-root");
+        let good = ident("good"); // will hold a valid org-root attestation
+        let bad = ident("bad"); // no attestation, just a docker host
+
+        let fake = FakeDriver::new(vec![
+            host_id(&good, 16, 16384, &["docker"]),
+            host_id(&bad, 16, 16384, &["docker"]),
+        ]);
+        // The good host serves a REAL org-root stable attestation bound to its own id.
+        let att = crate::stable::mint_stable_attestation(
+            &org_root,
+            good.node_id(),
+            ce_cap::Caveats::default(),
+            1,
+        );
+        fake.set_stable_attestation(&good.node_id_hex(), &crate::stable::encode_attestation(&att));
+
+        let d = stable_deploy(2);
+        let mut ctrl = Controller::new(None).with_org_root(org_root.node_id());
+        ctrl.max_stale_secs = 0;
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        // Only the attested host qualifies → both replicas land there; the other is not a candidate.
+        assert_eq!(r.placed.len(), 2);
+        assert!(
+            ctrl.current().iter().all(|rep| rep.node_id == good.node_id_hex()),
+            "all replicas must be on the attested host"
+        );
+        assert_eq!(r.place_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn stable_affinity_rejects_self_claimed_tag() {
+        let org_root = ident("org-root");
+        // A host that self-claims the `stable` atlas tag but holds NO org-root attestation.
+        let liar = ident("liar");
+        let fake = FakeDriver::new(vec![host_id(&liar, 16, 16384, &["docker", "stable"])]);
+        // (Intentionally no set_stable_attestation for `liar`.)
+
+        let d = stable_deploy(1);
+        let mut ctrl = Controller::new(None).with_org_root(org_root.node_id());
+        ctrl.max_stale_secs = 0;
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        // The self-claimed tag does not qualify → no candidate → placement fails (not panics).
+        assert_eq!(r.placed.len(), 0);
+        assert_eq!(r.place_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn stable_affinity_rejects_non_root_signed_attestation() {
+        let org_root = ident("org-root");
+        let impostor = ident("impostor"); // signs an attestation, but is not the pinned root
+        let host = ident("host");
+        let fake = FakeDriver::new(vec![host_id(&host, 16, 16384, &["docker"])]);
+        // The host serves an attestation signed by the IMPOSTOR, not the org root.
+        let forged = crate::stable::mint_stable_attestation(
+            &impostor,
+            host.node_id(),
+            ce_cap::Caveats::default(),
+            1,
+        );
+        fake.set_stable_attestation(&host.node_id_hex(), &crate::stable::encode_attestation(&forged));
+
+        let d = stable_deploy(1);
+        // Controller pins the REAL org root.
+        let mut ctrl = Controller::new(None).with_org_root(org_root.node_id());
+        ctrl.max_stale_secs = 0;
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert_eq!(r.placed.len(), 0, "non-root-signed attestation must not qualify");
+        assert_eq!(r.place_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn stable_affinity_without_pinned_root_finds_no_candidate() {
+        let org_root = ident("org-root");
+        let good = ident("good");
+        let fake = FakeDriver::new(vec![host_id(&good, 16, 16384, &["docker"])]);
+        let att = crate::stable::mint_stable_attestation(
+            &org_root,
+            good.node_id(),
+            ce_cap::Caveats::default(),
+            1,
+        );
+        fake.set_stable_attestation(&good.node_id_hex(), &crate::stable::encode_attestation(&att));
+
+        let d = stable_deploy(1);
+        // No org root pinned on the controller → fail closed, even with a valid attestation present.
+        let mut ctrl = Controller::new(None);
+        ctrl.max_stale_secs = 0;
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert_eq!(r.placed.len(), 0);
+        assert_eq!(r.place_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn non_stable_deployment_ignores_attestations() {
+        // A deployment WITHOUT require_stable places on any docker host, attested or not.
+        let plain = ident("plain");
+        let fake = FakeDriver::new(vec![host_id(&plain, 16, 16384, &["docker"])]);
+        let d = deploy(1, Strategy::default()); // require_stable = false
+        let mut ctrl = Controller::new(None); // no org root needed
+        ctrl.max_stale_secs = 0;
+        let r = ctrl.tick(&fake, &d).await.unwrap();
+        assert_eq!(r.placed.len(), 1);
     }
 }

@@ -30,6 +30,16 @@ pub fn host_matches_tags(host: &AtlasEntry, required: &[String]) -> bool {
     required.iter().all(|t| host.has_tag(t))
 }
 
+/// Does this host satisfy the deployment's `require_stable` affinity?
+///
+/// When `d.require_stable` is false, every host satisfies it. When true, the host's `node_id` must
+/// appear in `stable_ids` — the set of hosts whose org-root stable attestation the controller has
+/// **already verified offline** against the pinned org-root pubkey (see [`crate::stable`]). A
+/// self-claimed `stable` atlas tag never lands a host in that set, so it never qualifies here.
+pub fn host_matches_stable(host: &AtlasEntry, d: &Deployment, stable_ids: &[String]) -> bool {
+    !d.require_stable || stable_ids.iter().any(|id| id == &host.node_id)
+}
+
 /// Rough free capacity of a host: total capacity minus an estimate of what its running jobs already
 /// consume. We do not know exact per-job sizes from the atlas, so we charge each running job one
 /// core and a memory slice; this is a conservative bin-packing heuristic, never an over-commit.
@@ -45,9 +55,14 @@ pub fn free_capacity(host: &AtlasEntry, per_replica_cpu: u32, per_replica_mem_mb
     (free_cpu, free_mem)
 }
 
-/// Can this host fit one more replica of the deployment, given its current load?
-pub fn host_can_fit(host: &AtlasEntry, d: &Deployment) -> bool {
+/// Can this host fit one more replica of the deployment, given its current load and the deployment's
+/// affinities? `stable_ids` is the verified-stable host set used to enforce `require_stable` (empty
+/// when the deployment does not require stability).
+pub fn host_can_fit(host: &AtlasEntry, d: &Deployment, stable_ids: &[String]) -> bool {
     if !host_matches_tags(host, &d.required_tags()) {
+        return false;
+    }
+    if !host_matches_stable(host, d, stable_ids) {
         return false;
     }
     let (free_cpu, free_mem) = free_capacity(host, d.resources.cpu_cores, d.resources.mem_mb as u32);
@@ -73,11 +88,21 @@ pub fn score_host(host: &AtlasEntry, d: &Deployment) -> i64 {
 /// for deterministic, reproducible output. `now_secs` and `max_stale_secs` drop hosts whose last
 /// capacity signal is older than the freshness window (a silent/dead host is not a candidate); pass
 /// `max_stale_secs == 0` to disable the freshness filter (useful in tests with synthetic timestamps).
-pub fn rank(atlas: &[AtlasEntry], d: &Deployment, now_secs: u64, max_stale_secs: u64) -> Vec<Candidate> {
+///
+/// `stable_ids` is the set of host NodeIds whose org-root **stable attestation** the controller has
+/// already verified offline (see [`crate::stable`]); when `d.require_stable` is set, only hosts in
+/// this set survive. Pass an empty slice when the deployment does not require stability.
+pub fn rank(
+    atlas: &[AtlasEntry],
+    d: &Deployment,
+    now_secs: u64,
+    max_stale_secs: u64,
+    stable_ids: &[String],
+) -> Vec<Candidate> {
     let mut cands: Vec<Candidate> = atlas
         .iter()
         .filter(|h| max_stale_secs == 0 || now_secs.saturating_sub(h.last_seen_secs) <= max_stale_secs)
-        .filter(|h| host_can_fit(h, d))
+        .filter(|h| host_can_fit(h, d, stable_ids))
         .map(|h| {
             let (free_cpu, free_mem) =
                 free_capacity(h, d.resources.cpu_cores, d.resources.mem_mb as u32);
@@ -155,15 +180,53 @@ mod tests {
     fn host_can_fit_requires_tags_and_headroom() {
         let d = deploy(2, 1024, &["gpu"]);
         // right tags, plenty of room
-        assert!(host_can_fit(&host("a", 8, 8192, 0, 0, &["docker", "gpu"]), &d));
+        assert!(host_can_fit(&host("a", 8, 8192, 0, 0, &["docker", "gpu"]), &d, &[]));
         // missing gpu tag
-        assert!(!host_can_fit(&host("b", 8, 8192, 0, 0, &["docker"]), &d));
+        assert!(!host_can_fit(&host("b", 8, 8192, 0, 0, &["docker"]), &d, &[]));
         // missing docker tag
-        assert!(!host_can_fit(&host("c", 8, 8192, 0, 0, &["gpu"]), &d));
+        assert!(!host_can_fit(&host("c", 8, 8192, 0, 0, &["gpu"]), &d, &[]));
         // not enough cpu
-        assert!(!host_can_fit(&host("d", 1, 8192, 0, 0, &["docker", "gpu"]), &d));
+        assert!(!host_can_fit(&host("d", 1, 8192, 0, 0, &["docker", "gpu"]), &d, &[]));
         // not enough mem
-        assert!(!host_can_fit(&host("e", 8, 512, 0, 0, &["docker", "gpu"]), &d));
+        assert!(!host_can_fit(&host("e", 8, 512, 0, 0, &["docker", "gpu"]), &d, &[]));
+    }
+
+    #[test]
+    fn require_stable_filters_to_attested_hosts() {
+        let mut d = deploy(1, 256, &[]);
+        d.require_stable = true;
+        let attested = host("att", 8, 8192, 0, 0, &["docker"]);
+        // self-claimed `stable` atlas tag, but NOT in the verified-stable set
+        let self_claimed = host("fake", 8, 8192, 0, 0, &["docker", "stable"]);
+        // Only "att" was verified by the controller (its org-root attestation passed).
+        let stable_ids = vec!["att".to_string()];
+        assert!(host_can_fit(&attested, &d, &stable_ids));
+        assert!(!host_can_fit(&self_claimed, &d, &stable_ids), "self-claimed tag must not qualify");
+        // With no verified-stable set, even a docker host does not qualify when stability is required.
+        assert!(!host_can_fit(&attested, &d, &[]));
+    }
+
+    #[test]
+    fn rank_with_require_stable_selects_only_attested() {
+        let mut d = deploy(1, 256, &[]);
+        d.require_stable = true;
+        let atlas = vec![
+            host("attested", 8, 8192, 0, 100, &["docker"]),
+            host("selfclaim", 8, 8192, 0, 100, &["docker", "stable"]),
+            host("plain", 8, 8192, 0, 100, &["docker"]),
+        ];
+        // Controller verified only "attested".
+        let r = rank(&atlas, &d, 100, 0, &["attested".to_string()]);
+        assert_eq!(r.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), vec!["attested"]);
+    }
+
+    #[test]
+    fn rank_without_require_stable_ignores_stable_set() {
+        let d = deploy(1, 256, &[]); // require_stable = false
+        let atlas = vec![host("a", 8, 8192, 0, 100, &["docker"])];
+        // No attestation needed when the deployment does not require stability.
+        let r = rank(&atlas, &d, 100, 0, &[]);
+        assert_eq!(r.len(), 1);
     }
 
     #[test]
@@ -174,7 +237,7 @@ mod tests {
             host("empty", 8, 8192, 0, 100, &["docker"]),
             host("mid", 8, 8192, 3, 100, &["docker"]),
         ];
-        let r = rank(&atlas, &d, 100, 0);
+        let r = rank(&atlas, &d, 100, 0, &[]);
         assert_eq!(r.len(), 3);
         assert_eq!(r[0].node_id, "empty");
         assert_eq!(r[1].node_id, "mid");
@@ -189,7 +252,7 @@ mod tests {
             host("nogpu", 8, 8192, 0, 100, &["docker"]),
             host("full", 2, 1024, 1, 100, &["docker", "gpu"]),
         ];
-        let r = rank(&atlas, &d, 100, 0);
+        let r = rank(&atlas, &d, 100, 0, &[]);
         assert_eq!(r.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), vec!["ok"]);
     }
 
@@ -201,7 +264,7 @@ mod tests {
             host("stale", 8, 8192, 0, 100, &["docker"]),
         ];
         // now=1100, window=200 → stale (last seen 100, age 1000) dropped; fresh (age 100) kept.
-        let r = rank(&atlas, &d, 1100, 200);
+        let r = rank(&atlas, &d, 1100, 200, &[]);
         assert_eq!(r.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), vec!["fresh"]);
     }
 
@@ -214,13 +277,13 @@ mod tests {
             host("aaa", 4, 4096, 0, 100, &["docker"]),
             host("mmm", 4, 4096, 0, 100, &["docker"]),
         ];
-        let r = rank(&atlas, &d, 100, 0);
+        let r = rank(&atlas, &d, 100, 0, &[]);
         assert_eq!(r.iter().map(|c| c.node_id.as_str()).collect::<Vec<_>>(), vec!["aaa", "mmm", "zzz"]);
     }
 
     #[test]
     fn rank_empty_atlas_is_empty() {
-        assert!(rank(&[], &deploy(1, 256, &[]), 0, 0).is_empty());
+        assert!(rank(&[], &deploy(1, 256, &[]), 0, 0, &[]).is_empty());
     }
 
     #[test]

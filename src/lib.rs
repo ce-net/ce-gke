@@ -72,6 +72,7 @@ pub mod sdk;
 pub mod secrets;
 pub mod serve;
 pub mod spec;
+pub mod stable;
 pub mod stack;
 pub mod state;
 
@@ -86,5 +87,8 @@ pub use reconcile::{reconcile, Phase, Plan, ReplicaState};
 pub use rollout::{plan_step, RolloutStep};
 pub use secrets::SecretStore;
 pub use spec::{DependencyRef, Deployment, EnvVar, Probe, ProbeKind, Resources, Strategy};
+pub use stable::{
+    encode_attestation, is_stable, mint_stable_attestation, verify_stable, ABILITY_STABLE,
+};
 pub use stack::{topo_sort, Stack};
 pub use state::{ManagedDeployment, StateLock, Store};

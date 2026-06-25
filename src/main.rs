@@ -47,6 +47,11 @@ struct Cli {
     /// Override the secret file path (default: `<data_dir>/ce/gke-secrets.json`).
     #[arg(long, global = true)]
     secrets: Option<PathBuf>,
+    /// Pinned org-root public key (64-char hex NodeId) used to verify `stable` host attestations.
+    /// Required for any deployment with `require_stable: true` to find candidates. This mirrors the
+    /// org root pinned in nodes' `<data_dir>/roots`; a manifest can never widen which root is trusted.
+    #[arg(long, global = true)]
+    org_root: Option<String>,
     /// Max reconcile ticks per command before giving up convergence (still saves progress).
     #[arg(long, default_value = "60", global = true)]
     max_ticks: u32,
@@ -112,6 +117,45 @@ enum Cmd {
     Secret {
         #[command(subcommand)]
         op: SecretOp,
+    },
+    /// Org-root "stable" host attestations: mint one for a host (offline root), or inspect one.
+    Stable {
+        #[command(subcommand)]
+        op: StableOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum StableOp {
+    /// Mint a stable attestation for a host, signed by the offline org root. Run once per stable
+    /// host; install the printed token on that host (e.g. `<data_dir>/ce-gke/stable.token`) so its
+    /// `ce-gke serve` agent hands it out. The token is an org-root `ce-cap` binding the host NodeId.
+    Mint {
+        /// The host's NodeId (64-char hex) to designate as stable.
+        node_id: String,
+        /// Path to the offline org-root identity directory (the `ce-root` key). The signing key
+        /// never leaves this machine; only the resulting token is distributed.
+        #[arg(long)]
+        root_key: PathBuf,
+        /// Optional expiry in days (host loses its designation after this without a revocation
+        /// round-trip). Omit for a non-expiring attestation.
+        #[arg(long)]
+        expires_days: Option<u64>,
+        /// Issuer-chosen nonce naming this attestation for on-chain revocation. Default 1.
+        #[arg(long, default_value = "1")]
+        nonce: u64,
+    },
+    /// Verify a stable attestation token offline against an org-root pubkey, printing whether it
+    /// vouches for the given host. Useful for an operator to confirm a minted token before install.
+    Verify {
+        /// The attestation token (hex `ce-cap` chain).
+        token: String,
+        /// The host NodeId (64-char hex) the attestation should vouch for.
+        #[arg(long)]
+        node_id: String,
+        /// The pinned org-root pubkey (64-char hex). Defaults to the global `--org-root`.
+        #[arg(long)]
+        org_root: Option<String>,
     },
 }
 
@@ -194,6 +238,7 @@ async fn main() -> Result<()> {
             return serve_cmd(&cli, *require_grant, *poll_ms).await;
         }
         Cmd::Secret { op } => return secret_cmd(op, &secret_path),
+        Cmd::Stable { op } => return stable_cmd(&cli, op),
         _ => {}
     }
 
@@ -207,7 +252,9 @@ async fn main() -> Result<()> {
         Cmd::Scale { name, replicas } => scale(&cli, &driver, &mut store, name, *replicas).await?,
         Cmd::Rollout { op } => rollout_cmd(&cli, &driver, &mut store, op).await?,
         Cmd::Delete { name, force } => delete(&cli, &driver, &mut store, name, *force).await?,
-        Cmd::Run { .. } | Cmd::Serve { .. } | Cmd::Secret { .. } => unreachable!(),
+        Cmd::Run { .. } | Cmd::Serve { .. } | Cmd::Secret { .. } | Cmd::Stable { .. } => {
+            unreachable!()
+        }
     }
 
     store.save(&state_path)?;
@@ -505,6 +552,7 @@ async fn reconcile_to_convergence<D: MeshDriver>(
 ) -> Result<()> {
     let managed = store.get(key).context("deployment vanished")?.clone();
     let mut ctrl = Controller::new(managed.grant.clone().or_else(|| cli.grant.clone()));
+    ctrl.org_root = cli_org_root(cli)?;
     ctrl.replicas = managed.replicas.clone();
     let spec = managed.spec.clone();
 
@@ -569,6 +617,7 @@ async fn run_cmd(
         interval_secs: every,
         namespace: if all_namespaces { None } else { Some(cli.namespace.clone()) },
         grant: cli.grant.clone(),
+        org_root: cli_org_root(cli)?,
     };
     let (tx, rx) = watch::channel(false);
     // Wire OS signals to the shutdown channel.
@@ -605,7 +654,7 @@ async fn wait_for_shutdown() {
 
 /// The host-side health agent loop: answer probe requests on the probe topic.
 async fn serve_cmd(cli: &Cli, require_grant: bool, poll_ms: u64) -> Result<()> {
-    use ce_gke::serve::{handle_probe_bytes, JobSource, ProbeAuthority};
+    use ce_gke::serve::{handle_attest_bytes, handle_probe_bytes, JobSource, ProbeAuthority};
 
     let ce = CeClient::new(cli.node.clone());
     let status = ce.status().await.context("querying node status")?;
@@ -617,7 +666,15 @@ async fn serve_cmd(cli: &Cli, require_grant: bool, poll_ms: u64) -> Result<()> {
         revoked_set.iter().any(|(iss, n)| iss == &hex::encode(issuer) && *n == nonce)
     };
 
+    // Load this host's stable attestation, if installed. It is served verbatim to candidate queries;
+    // the orchestrator verifies it offline against its pinned org root before trusting it.
+    let stable_token = load_stable_token();
+    if stable_token.is_some() {
+        println!("ce-gke serve: holding a stable attestation; serving it on '{}'", ce_gke::protocol::STABLE_TOPIC);
+    }
+
     ce.subscribe(ce_gke::protocol::PROBE_TOPIC).await.ok();
+    ce.subscribe(ce_gke::protocol::STABLE_TOPIC).await.ok();
     println!(
         "ce-gke serve: answering probes on '{}' as {} (require_grant={require_grant})",
         ce_gke::protocol::PROBE_TOPIC,
@@ -644,14 +701,21 @@ async fn serve_cmd(cli: &Cli, require_grant: bool, poll_ms: u64) -> Result<()> {
             }
         };
         for msg in msgs {
-            if msg.topic != ce_gke::protocol::PROBE_TOPIC {
-                continue;
-            }
             let Some(token) = msg.reply_token else { continue };
             let payload = match msg.payload() {
                 Ok(p) => p,
                 Err(_) => continue,
             };
+            // Stable-attestation queries: hand back the installed token (or none). Public, no grant.
+            if msg.topic == ce_gke::protocol::STABLE_TOPIC {
+                if let Ok(reply) = handle_attest_bytes(&payload, stable_token.as_deref()) {
+                    let _ = ce.reply(token, &reply).await;
+                }
+                continue;
+            }
+            if msg.topic != ce_gke::protocol::PROBE_TOPIC {
+                continue;
+            }
             let requester = match parse_node_id(&msg.from) {
                 Some(id) => id,
                 None => continue,
@@ -820,6 +884,60 @@ fn parse_node_id(hex_id: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Parse the global `--org-root` flag into a pinned [`ce_identity::NodeId`], if set. An invalid hex
+/// id is a hard error (a `require_stable` deployment must never silently fall back to "trust nobody"
+/// because of a typo'd root).
+fn cli_org_root(cli: &Cli) -> Result<Option<[u8; 32]>> {
+    match &cli.org_root {
+        Some(s) => Ok(Some(
+            parse_node_id(s).context("--org-root is not a 64-char hex node id")?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// `ce-gke stable` subcommand: mint or verify an org-root stable host attestation. Offline (no node).
+fn stable_cmd(cli: &Cli, op: &StableOp) -> Result<()> {
+    use ce_gke::stable::{encode_attestation, mint_stable_attestation, verify_stable};
+    use ce_cap::Caveats;
+    use ce_identity::Identity;
+
+    match op {
+        StableOp::Mint { node_id, root_key, expires_days, nonce } => {
+            let host_id = parse_node_id(node_id)
+                .context("host node id is not 64-char hex")?;
+            // Load the offline org-root key. Its public half is what nodes pin in `<data_dir>/roots`.
+            let root = Identity::load_or_generate(root_key)
+                .context("loading the org-root identity")?;
+            let caveats = match expires_days {
+                Some(d) => Caveats { not_after: now_secs() + d * 24 * 3600, ..Default::default() },
+                None => Caveats::default(),
+            };
+            let att = mint_stable_attestation(&root, host_id, caveats, *nonce);
+            let token = encode_attestation(&att);
+            println!("# stable attestation for {}", short(node_id));
+            println!("# org root (pin this as --org-root): {}", root.node_id_hex());
+            println!("# install on the host as <data_dir>/ce-gke/stable.token");
+            println!("{token}");
+            Ok(())
+        }
+        StableOp::Verify { token, node_id, org_root } => {
+            let host_id = parse_node_id(node_id).context("host node id is not 64-char hex")?;
+            let root_hex = org_root.as_ref().or(cli.org_root.as_ref()).context(
+                "no org root: pass --org-root <hex> (global) or stable verify --org-root <hex>",
+            )?;
+            let root = parse_node_id(root_hex).context("org root is not 64-char hex")?;
+            match verify_stable(token, &host_id, &root, now_secs(), &|_, _| false) {
+                Ok(()) => {
+                    println!("VALID: org root {} vouches {} as stable", short(root_hex), short(node_id));
+                    Ok(())
+                }
+                Err(e) => bail!("INVALID: {e}"),
+            }
+        }
+    }
+}
+
 /// Extract the root issuer(s) of a grant token's chain so preflight can root at it.
 fn grant_roots(token: &str) -> Result<Vec<[u8; 32]>> {
     let chain = ce_cap::decode_chain(token)?;
@@ -831,6 +949,30 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Load this host's installed stable attestation token, if any. Looked up from `CE_GKE_STABLE_TOKEN`
+/// (the token directly, or a path to it) first, then the default `<data_dir>/ce-gke/stable.token`.
+/// Trimmed; an empty/missing file yields `None` (the host is simply not attested).
+fn load_stable_token() -> Option<String> {
+    if let Ok(v) = std::env::var("CE_GKE_STABLE_TOKEN") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            // Allow either the token inline or a path to a file holding it.
+            if let Ok(contents) = std::fs::read_to_string(&v) {
+                let t = contents.trim().to_string();
+                if !t.is_empty() {
+                    return Some(t);
+                }
+            }
+            return Some(v);
+        }
+    }
+    let path = directories::ProjectDirs::from("com", "ce", "ce")
+        .map(|d| d.data_dir().join("ce-gke").join("stable.token"))?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let t = contents.trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
 }
 
 #[cfg(test)]

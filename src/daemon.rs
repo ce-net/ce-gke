@@ -33,6 +33,9 @@ pub struct DaemonConfig {
     pub namespace: Option<String>,
     /// Fallback grant for deployments that carry none.
     pub grant: Option<String>,
+    /// Pinned org-root pubkey for verifying `stable` attestations (see [`crate::stable`]). `None`
+    /// disables stable verification (a `require_stable` deployment then finds no candidate).
+    pub org_root: Option<ce_identity::NodeId>,
 }
 
 /// Run one reconcile pass over every managed deployment (optionally filtered by namespace). Returns
@@ -43,6 +46,7 @@ pub async fn reconcile_pass<D: MeshDriver>(
     store: &mut Store,
     namespace: Option<&str>,
     fallback_grant: Option<&str>,
+    org_root: Option<ce_identity::NodeId>,
 ) -> usize {
     let keys: Vec<String> = match namespace {
         Some(ns) => store.names_in(ns),
@@ -58,6 +62,7 @@ pub async fn reconcile_pass<D: MeshDriver>(
         let spec = managed.spec.clone();
         let grant = managed.grant.clone().or_else(|| fallback_grant.map(str::to_string));
         let mut ctrl = Controller::new(grant);
+        ctrl.org_root = org_root;
         ctrl.replicas = managed.replicas.clone();
         match ctrl.tick(driver, &spec).await {
             Ok(report) => {
@@ -116,9 +121,14 @@ pub async fn run_daemon<D: MeshDriver>(
             let _lock = StateLock::acquire(&cfg.state_path)
                 .context("daemon could not acquire the state lock")?;
             let mut store = Store::load(&cfg.state_path)?;
-            let unconverged =
-                reconcile_pass(driver, &mut store, cfg.namespace.as_deref(), cfg.grant.as_deref())
-                    .await;
+            let unconverged = reconcile_pass(
+                driver,
+                &mut store,
+                cfg.namespace.as_deref(),
+                cfg.grant.as_deref(),
+                cfg.org_root,
+            )
+            .await;
             store.save(&cfg.state_path)?;
             if unconverged > 0 {
                 tracing::debug!(unconverged, "deployments not yet converged");
@@ -182,12 +192,12 @@ mod tests {
         store.upsert(deploy("web", "team-a", 2), None);
         store.upsert(deploy("api", "team-b", 1), None);
         // First pass places replicas (Pending), not yet converged.
-        let unconverged = reconcile_pass(&fake, &mut store, None, None).await;
+        let unconverged = reconcile_pass(&fake, &mut store, None, None, None).await;
         assert!(unconverged >= 1);
         fake.mark_all_ready();
         // Subsequent passes drive to convergence.
         for _ in 0..5 {
-            reconcile_pass(&fake, &mut store, None, None).await;
+            reconcile_pass(&fake, &mut store, None, None, None).await;
             fake.mark_all_ready();
         }
         assert_eq!(store.get("team-a/web").unwrap().replicas.len(), 2);
@@ -202,7 +212,7 @@ mod tests {
         store.upsert(deploy("api", "team-b", 2), None);
         // Only reconcile team-a.
         for _ in 0..5 {
-            reconcile_pass(&fake, &mut store, Some("team-a"), None).await;
+            reconcile_pass(&fake, &mut store, Some("team-a"), None, None).await;
             fake.mark_all_ready();
         }
         assert_eq!(store.get("team-a/web").unwrap().replicas.len(), 2);
@@ -215,15 +225,15 @@ mod tests {
         let mut store = Store::default();
         store.upsert(deploy("web", "default", 2), None);
         for _ in 0..5 {
-            reconcile_pass(&fake, &mut store, None, None).await;
+            reconcile_pass(&fake, &mut store, None, None, None).await;
             fake.mark_all_ready();
         }
         let victim = store.get("default/web").unwrap().replicas[0].job_id.clone();
         fake.set_phase(&victim, crate::reconcile::Phase::Failed);
         // A pass reaps + replaces it.
-        reconcile_pass(&fake, &mut store, None, None).await;
+        reconcile_pass(&fake, &mut store, None, None, None).await;
         fake.mark_all_ready();
-        reconcile_pass(&fake, &mut store, None, None).await;
+        reconcile_pass(&fake, &mut store, None, None, None).await;
         let reps = &store.get("default/web").unwrap().replicas;
         assert_eq!(reps.len(), 2);
         assert!(!reps.iter().any(|r| r.job_id == victim), "victim replaced");
@@ -245,6 +255,7 @@ mod tests {
             interval_secs: 1,
             namespace: None,
             grant: None,
+            org_root: None,
         };
         // Signal shutdown almost immediately; the daemon must return promptly.
         tokio::spawn(async move {

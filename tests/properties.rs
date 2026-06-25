@@ -107,7 +107,7 @@ proptest! {
             node_id: format!("h{i}"), cpu_cores: c, mem_mb: 4096, running_jobs: 0,
             last_seen_secs: 0, tags: vec!["docker".into()],
         }).collect();
-        let ranked = rank(&atlas, &d, 0, 0);
+        let ranked = rank(&atlas, &d, 0, 0, &[]);
         // sorted by score desc
         for w in ranked.windows(2) {
             prop_assert!(w[0].score >= w[1].score);
@@ -129,16 +129,16 @@ proptest! {
             node_id: "h".into(), cpu_cores: cpu, mem_mb: mem, running_jobs: jobs,
             last_seen_secs: 0, tags: vec!["docker".into()],
         };
-        let ranked = rank(std::slice::from_ref(&h), &d, 0, 0);
+        let ranked = rank(std::slice::from_ref(&h), &d, 0, 0, &[]);
         if let Some(c) = ranked.first() {
             // The candidate was deemed to fit; its reported headroom must cover one replica.
             prop_assert!(c.free_cpu >= rep_cpu);
             prop_assert!(c.free_mem_mb >= rep_mem as u32);
             // And host_can_fit agrees (rank and fit are consistent).
-            prop_assert!(host_can_fit(&h, &d));
+            prop_assert!(host_can_fit(&h, &d, &[]));
         } else {
             // If not ranked, the host genuinely cannot fit.
-            prop_assert!(!host_can_fit(&h, &d));
+            prop_assert!(!host_can_fit(&h, &d, &[]));
         }
         // free_capacity is monotone non-increasing in running_jobs (more load never frees space).
         let (f0, m0) = free_capacity(&h, rep_cpu, rep_mem as u32);
