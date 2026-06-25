@@ -68,6 +68,7 @@ pub mod placement;
 pub mod protocol;
 pub mod reconcile;
 pub mod rollout;
+pub mod sdk;
 pub mod secrets;
 pub mod serve;
 pub mod spec;
@@ -75,6 +76,7 @@ pub mod stack;
 pub mod state;
 
 pub use controller::{Controller, TickReport};
+pub use sdk::{Claim, Dep, Gke, Handle, Lease, MemRegistry, Place, Registry};
 pub use daemon::{run_daemon, DaemonConfig};
 pub use deps::{DepReadiness, Gate};
 pub use driver::{CeDriver, FakeDriver, MeshDriver};
