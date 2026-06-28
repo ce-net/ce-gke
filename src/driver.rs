@@ -6,7 +6,7 @@
 //! deploy, a dropped peer on kill, a job that fails health) — without a live node. That is how the
 //! "failure → reschedule" behavior is validated.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -145,6 +145,34 @@ impl CeDriver {
             bid: d.bid,
         })
     }
+
+    /// Resolve an `app://<name>[@ver]` image reference to a concrete oci image by
+    /// resolving the app through ce-appmgr (manifest + deps). A plain image string
+    /// passes through unchanged, so existing Deployments are unaffected.
+    /// Registry origin: `CE_APP_REGISTRY` (default `https://ce-net.com`).
+    async fn resolve_image(&self, image: &str) -> Result<String> {
+        let Some(app_ref) = image.strip_prefix("app://") else {
+            return Ok(image.to_string());
+        };
+        let name = app_ref.split('@').next().unwrap_or(app_ref);
+        let registry =
+            std::env::var("CE_APP_REGISTRY").unwrap_or_else(|_| "https://ce-net.com".to_string());
+        let reg = ce_appmgr::HubRegistry::new(&registry);
+        let plan = ce_appmgr::resolve(&reg, name)
+            .await
+            .with_context(|| format!("resolving app '{name}' for image {image}"))?;
+        let root = plan
+            .items
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("empty resolve plan for app '{name}'"))?;
+        root.manifest
+            .oci
+            .as_ref()
+            .map(|o| o.image.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("app '{name}' is not an oci app; ce-gke needs an oci image to schedule")
+            })
+    }
 }
 
 impl MeshDriver for CeDriver {
@@ -153,7 +181,8 @@ impl MeshDriver for CeDriver {
     }
 
     async fn deploy(&self, node_id: &str, d: &Deployment, grant: Option<&str>) -> Result<String> {
-        let spec = self.bid_spec(d)?;
+        let mut spec = self.bid_spec(d)?;
+        spec.image = self.resolve_image(&spec.image).await?;
         self.ce.mesh_deploy(node_id, &spec, grant).await
     }
 

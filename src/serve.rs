@@ -20,7 +20,7 @@
 //! is the documented "real slice now, deeper exec deferred" boundary.
 
 use anyhow::Result;
-use ce_cap::{authorize, decode_chain};
+use ce_iam_core::{authorize, decode_chain};
 use ce_identity::NodeId;
 
 use crate::auth::ACTION_PROBE;
@@ -143,7 +143,7 @@ pub fn handle_attest_bytes(payload: &[u8], held: Option<&str>) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ce_cap::{encode_chain, Caveats, Resource};
+    use ce_iam_core::{encode_chain, Caveats, Resource};
     use ce_identity::Identity;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -11,7 +11,7 @@
 //! mesh. The host remains the real enforcement point.
 
 use anyhow::Result;
-use ce_cap::{authorize, decode_chain, Caveats, Resource, SignedCapability};
+use ce_iam_core::{authorize, decode_chain, Caveats, Resource, SignedCapability};
 use ce_identity::{Identity, NodeId};
 
 /// The action a deploy requires on the host. Opaque string in ce-cap; ce-gke owns this vocabulary.
@@ -70,13 +70,13 @@ pub fn preflight(
 
 /// Encode a chain back to the portable hex token carried as the `grant`.
 pub fn token(chain: &[SignedCapability]) -> String {
-    ce_cap::encode_chain(chain)
+    ce_iam_core::encode_chain(chain)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ce_cap::encode_chain;
+    use ce_iam_core::encode_chain;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn id(tag: &str) -> Identity {

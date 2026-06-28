@@ -8,7 +8,7 @@
 //!
 //! ## What a stable attestation is
 //!
-//! A **stable attestation** is one [`ce_cap::SignedCapability`] issued by the offline organization
+//! A **stable attestation** is one [`ce_iam_core::SignedCapability`] issued by the offline organization
 //! root key (`ce-root`, the same key pinned in every node's `<data_dir>/roots/` per `ce-fleet`'s
 //! trust spine) that binds a *specific* [`NodeId`] as a stable host:
 //!
@@ -18,7 +18,7 @@
 //! - `resource` = `Resource::Node(host_id)` (the attestation applies to exactly this node),
 //! - `parent`   = `None` (a root delegation — its issuer must be the pinned org root).
 //!
-//! It is verified **offline** against the pinned org-root public key with `ce_cap::authorize`: no
+//! It is verified **offline** against the pinned org-root public key with `ce_iam_core::authorize`: no
 //! network, no chain lookup. Because `ce-cap` enforces the root issuer, the signature, the audience,
 //! the resource match, and (for a single link) attenuation trivially, a host that presents a valid
 //! attestation provably had `ce-root` vouch for *that NodeId*. A node cannot mint one for itself, and
@@ -39,7 +39,7 @@
 //! (e.g. `<data_dir>/ce-gke/stable.token`) for the serve agent to hand out.
 
 use anyhow::Result;
-use ce_cap::{authorize, decode_chain, encode_chain, Caveats, Resource, SignedCapability};
+use ce_iam_core::{authorize, decode_chain, encode_chain, Caveats, Resource, SignedCapability};
 use ce_identity::{Identity, NodeId};
 
 /// The opaque ce-cap ability string an org root grants to designate a host as stable. Opaque to
@@ -80,7 +80,7 @@ pub fn encode_attestation(attestation: &SignedCapability) -> String {
 /// Verify, **offline**, that `token` is a valid stable attestation for `host_id`, rooted at the
 /// pinned org root `org_root`.
 ///
-/// This is a thin, exact wrapper over `ce_cap::authorize` — it does NOT re-implement verification.
+/// This is a thin, exact wrapper over `ce_iam_core::authorize` — it does NOT re-implement verification.
 /// The attestation qualifies iff `authorize` accepts the decoded chain for:
 /// - `self_id`        = `host_id` (the node being vetted; the attestation's `Resource::Node` must match it),
 /// - `accepted_roots` = `[org_root]` (the ONLY accepted authority — the host's own id is not enough),
@@ -101,7 +101,7 @@ pub fn verify_stable(
     is_revoked: &dyn Fn(&NodeId, u64) -> bool,
 ) -> Result<()> {
     let chain = decode_chain(token)?;
-    // SECURITY: `ce_cap::authorize` treats `self_id` (which we set to `host_id` so the attestation's
+    // SECURITY: `ce_iam_core::authorize` treats `self_id` (which we set to `host_id` so the attestation's
     // `Resource::Node(host_id)` matches) as an *implicit accepted root*. That implicit-self rule is
     // correct for "a node delegates its OWN resources", but here it would let a host self-mint its own
     // `stable` attestation (issuer == host == implicit root) and pass. A stable attestation must come

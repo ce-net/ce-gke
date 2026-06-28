@@ -899,7 +899,7 @@ fn cli_org_root(cli: &Cli) -> Result<Option<[u8; 32]>> {
 /// `ce-gke stable` subcommand: mint or verify an org-root stable host attestation. Offline (no node).
 fn stable_cmd(cli: &Cli, op: &StableOp) -> Result<()> {
     use ce_gke::stable::{encode_attestation, mint_stable_attestation, verify_stable};
-    use ce_cap::Caveats;
+    use ce_iam_core::Caveats;
     use ce_identity::Identity;
 
     match op {
@@ -940,7 +940,7 @@ fn stable_cmd(cli: &Cli, op: &StableOp) -> Result<()> {
 
 /// Extract the root issuer(s) of a grant token's chain so preflight can root at it.
 fn grant_roots(token: &str) -> Result<Vec<[u8; 32]>> {
-    let chain = ce_cap::decode_chain(token)?;
+    let chain = ce_iam_core::decode_chain(token)?;
     Ok(chain.first().map(|c| vec![c.cap.issuer]).unwrap_or_default())
 }
 

@@ -816,7 +816,7 @@ mod tests {
         let att = crate::stable::mint_stable_attestation(
             &org_root,
             good.node_id(),
-            ce_cap::Caveats::default(),
+            ce_iam_core::Caveats::default(),
             1,
         );
         fake.set_stable_attestation(&good.node_id_hex(), &crate::stable::encode_attestation(&att));
@@ -861,7 +861,7 @@ mod tests {
         let forged = crate::stable::mint_stable_attestation(
             &impostor,
             host.node_id(),
-            ce_cap::Caveats::default(),
+            ce_iam_core::Caveats::default(),
             1,
         );
         fake.set_stable_attestation(&host.node_id_hex(), &crate::stable::encode_attestation(&forged));
@@ -883,7 +883,7 @@ mod tests {
         let att = crate::stable::mint_stable_attestation(
             &org_root,
             good.node_id(),
-            ce_cap::Caveats::default(),
+            ce_iam_core::Caveats::default(),
             1,
         );
         fake.set_stable_attestation(&good.node_id_hex(), &crate::stable::encode_attestation(&att));
